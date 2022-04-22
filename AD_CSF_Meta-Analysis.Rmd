@@ -1,0 +1,1325 @@
+---
+title: "AD_CSF_Meta-Analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: hide
+date: '2022-04-20'
+---
+# 0. Preparations & Imports
+
+### Libraries, functions, imports
+
+Import Libraries
+```{r, libraries, message=FALSE, class.source = 'fold-hide'}
+library(readxl)
+library(tidyverse)
+library(ggpubr)
+library(rstatix)
+library(msigdbr)
+library(clusterProfiler)
+library(ggrepel)
+library(ggthemes)
+library(gridExtra)
+library(eulerr)
+library(pROC)
+library(ggbeeswarm)
+library(ComplexHeatmap)
+library(circlize)
+library(extrafont)
+library(wesanderson)
+library(DT)
+library(enrichR)
+loadfonts(device = "win")
+```
+### Functions
+Create functions to import Fragpipe TMT and LFQ data.
+Create a function to detect and remove outliers (and visualize).
+```{r, class.source = 'fold-hide'}
+#Create Functions to clean the datasets. four in total: TMT-protein, TMT-peptide, LFQ-protein, LFQ-peptide.
+#Goal is to get to a long(tidy)format for each. For LFQ ones we also log transform.
+cleanTMT_protein <- function(dataset){
+  colnames_TMT_Protein <- colnames(dataset)[6:ncol(dataset)]
+  dataset <- dataset %>% gather(colnames_TMT_Protein, key = "Sample", value = "Intensity") %>%
+  mutate(ID = paste0(Index, "_", Gene)) %>%
+  select(ID, Sample, Intensity)
+  return(dataset)
+}
+cleanLFQ_protein <- function(dataset){
+  names(dataset)[names(dataset) == 'Protein ID'] <- 'ProteinID'
+  dataset <- dataset %>%
+    mutate(ID = paste0(ProteinID, "_", Gene)) %>%
+    dplyr::select(ID, contains("MaxLFQ Total Intensity")) #%>% select(-contains("MaxLFQ"))
+  dataset <- dataset %>%
+    gather(colnames(dataset)[2:ncol(dataset)], key = "Sample", value = "Intensity") 
+}
+
+OutlierRemover <- function(dataset, name){
+  #Determine correlations between sample and theoretical
+  SampleCorrelations <- dataset%>%
+    mutate(SampleDX = paste0(Sample,"_", DX)) %>%
+    group_by(ID) %>%
+    mutate(medianProtein = median(Intensity, na.rm = T)) %>%
+    ungroup() %>%
+    group_by(Sample) %>%
+    mutate(SampleCor = cor(Intensity, medianProtein, method = "pearson", use="complete.obs")) %>%
+    ungroup() %>%
+    distinct(SampleDX, .keep_all = T)
+  
+  SampleCorrelations <- SampleCorrelations %>%
+    mutate(Outlier = SampleCor < (1 - 4*sd(unique(SampleCorrelations$SampleCor))))
+  
+    #Make the DF that we will return (i.e. without outliers)
+  returnDataset <- dataset %>%
+    dplyr::filter(Sample %in% dplyr::filter(SampleCorrelations, Outlier == F)$Sample) %>%
+    select(ID, Sample, DX, Intensity)  
+  
+  #Purely for visualization: Also attached PCA Plots of the removed samples
+  
+  #PCA PLOT: 70% cut off
+  ProteinsToKeep <- dataset %>%
+    group_by(ID) %>%
+    summarise(PercentMissing = sum(!is.na(Intensity))/ length(unique(dataset$Sample))) %>%
+    mutate(remove = PercentMissing > 0.7) %>%
+    dplyr::filter(remove == T)
+    
+  #Half minimum value (per protein) imputation
+  PCA_DF <- dataset %>% 
+    dplyr::filter(ID %in% ProteinsToKeep$ID) %>%
+    group_by(ID) %>%
+    mutate(IntensImputed = replace_na(Intensity, mean(Intensity, na.rm = T)/2)) %>%
+    mutate(SampleDX = paste0(Sample,"_", DX)) %>%
+    select(ID, SampleDX, IntensImputed) %>%
+    spread(key = "ID", value = "IntensImputed") %>%
+    column_to_rownames("SampleDX")
+
+  #scale and PCA
+  PCA_DF_Results <- prcomp(scale(as.matrix(PCA_DF)))
+  eigs <- PCA_DF_Results$sdev^2
+  variance_percentage <- (eigs / sum(eigs))*100
+  pc1var <- round(variance_percentage[1],digits=0)
+  pc2var <- round(variance_percentage[2],digits=0)
+  
+  #Plot
+  plot(left_join(SampleCorrelations, rownames_to_column(data.frame(PCA_DF_Results$x)), by = c("SampleDX" = "rowname")) %>%
+    ggplot(aes(x = PC1, y = PC2, colour = Outlier)) +
+    geom_point() +
+    theme_bw() +
+    xlab(paste('PC1',' (',pc1var,'% variance)',sep='')) +
+    ylab(paste('PC2',' (',pc2var,'% variance)',sep='')) +
+    ggtitle(name))
+  
+  #Print and Return
+  print(paste("The following were removed from:", name, toString(dplyr::filter(SampleCorrelations, Outlier == T)$SampleDX)))
+  return(returnDataset)
+}
+```
+
+Function for Ttest (using 70% cut off) & visualization
+```{r}
+Ttest_AD <- function(dataset){
+  #70% cut off
+  ProteinsToKeep <- dataset %>%
+    group_by(ID) %>%
+    summarise(PercentMissing = sum(!is.na(Intensity))/ length(unique(dataset$Sample))) %>%
+    mutate(remove = PercentMissing > 0.7) %>%
+    dplyr::filter(remove == T)
+
+  dataset_ttest <- dataset %>%
+    filter(ID %in% ProteinsToKeep$ID) %>%
+    drop_na(Intensity) %>%
+    drop_na(DX) %>%
+    group_by(ID) %>%
+    t_test(Intensity ~ DX, detailed = T) %>%
+    adjust_pvalue(method = "BH") %>%
+    mutate(SIGNIFICANT = p.adj < 0.05) %>%
+  mutate(log10_padj = -1*log10(p.adj))
+  
+  ttestPlot <- dataset_ttest %>%
+    dplyr::mutate(FC = estimate1 - estimate2) %>%
+    mutate(log10adjustP = -1*log10(p.adj)) %>%
+    mutate(Direction = ifelse(p.adj > 0.05, "NotSignificant", ifelse(FC < 0, "Down", "Up"))) %>%
+    ggplot(aes(x = FC, y = log10adjustP, fill = Direction)) +
+    geom_point(size = 3, shape = 21) +
+    scale_fill_manual(values = c("Down" = "#164db5","NotSignificant" = "darkgrey", "Up" = "#d90429")) +
+    theme_pubr() +
+    geom_hline(yintercept = 1.3, linetype = 2, alpha = 0.7) +
+    xlab("Fold Change (Old - Young)") +
+    ylab("-log10(adjusted p-value)") +
+    theme(legend.position= "none")
+
+  plot(ttestPlot)
+  
+  return(dataset_ttest)
+}
+```
+
+### Imports
+Import datasets
+```{r, import and clean DF, message=FALSE, class.source = 'fold-hide'}
+Dayon_protein_clean <- cleanTMT_protein(read_tsv("Datasets/Dayon_abundance_protein_None.tsv"))
+Omar_protein_clean <- cleanTMT_protein(read_tsv("Datasets/Omar_abundance_protein_None.tsv"))
+Sathe_protein_clean <- cleanTMT_protein(read_tsv("Datasets/Sathe_abundance_protein_None.tsv"))
+Zetterberg_protein_clean <- cleanLFQ_protein(read_tsv("Datasets/Zetterberg_combined_protein.tsv"))
+Lleo_protein_clean <- cleanLFQ_protein(read_tsv("Datasets/Lleo_combined_protein.tsv"))
+Wang_protein_clean <- cleanLFQ_protein(read_tsv("Datasets/Wang_combined_protein.tsv"))
+Multhaup_protein_clean <- cleanLFQ_protein(read_tsv("Datasets/Multhaup_combined_protein.tsv"))
+Khoonsari_protein_clean <- cleanLFQ_protein(read_tsv("Datasets/Khoonsari_combined_protein.tsv"))
+```
+
+# 1. Meta-Analysis
+
+## Clean and combine with Clinical {.tabset}
+
+Each dataset required a slighly different approach to prepare it for the combinatory meta-analysis. Per dataset we first normalize (with or without pool etc) followed by the removal of outliers. Lastly, we set the clinical data based on sample name or meta information with a given publication.
+
+
+
+### Dayon
+
+#### Normalization
+We normalize on reference samples. Fragpipe TMTintegrator had issues with two reference samples hence I named them SP and bool
+```{r, normalize dayon, class.source = 'fold-hide'}
+#First calculate per sample the median intensity.
+#Then take the mean of all those medians.
+Dayon_protein_clean_references <- 
+  Dayon_protein_clean %>%
+  mutate(Intensity = 2^Intensity)%>%
+  dplyr::filter(grepl('Bool|SP', Sample)) %>%
+  group_by(Sample) %>%
+  summarise(PerSampleMedian = median(Intensity, na.rm = TRUE)) %>%
+  ungroup() %>%
+  summarise(AverageMedian = mean(PerSampleMedian))
+Dayon_averagemedianofreferences <- mean(Dayon_protein_clean_references$AverageMedian)
+
+#Only select samples, calculate median per sample.
+#Determine per sample normalization factor
+#apply it to intensity column. 
+#clean up.
+Dayon_protein_clean_noreferences <- 
+  Dayon_protein_clean %>%
+  mutate(Intensity = 2^Intensity)%>%
+  dplyr::filter(!grepl('Bool|SP', Sample)) %>%
+  group_by(Sample) %>%
+  mutate(PerSampleMedian = median(Intensity, na.rm = TRUE)) %>%
+  mutate(NormalizeFactor = Dayon_averagemedianofreferences/ PerSampleMedian) %>%
+  mutate(Intensity = Intensity * NormalizeFactor) %>%
+  ungroup() %>%
+  mutate(Intensity = log2(Intensity)) %>%
+  select(ID, Sample, Intensity)
+```
+
+#### mean calculation
+This dataset had duplicates. We take average of each.
+Looks like I did not properly capitalize each sample. We also account for that.
+```{r, mean calculation dayon,class.source = 'fold-hide'}
+#split sample name
+#group sample_a and ID
+#Replace intensity by mean of the two.
+#only take one of the two.
+#remove NaN's, clean up columns
+Dayon_protein_clean_averaged <- 
+Dayon_protein_clean_noreferences %>%
+  mutate(sample_b = substr(Sample, 5,6)) %>% #260160 rows 
+  mutate(Sample = str_to_title(substr(Sample, 1,4))) %>%
+  group_by(Sample, ID) %>%
+  mutate(Intensity = mean(Intensity, na.rm = TRUE)) %>%
+  dplyr::filter(sample_b == "01") %>%
+  na_if("NaN") %>%
+  select(ID, Sample, Intensity)
+```
+
+#### Set Clinical
+This dataset did have some clinical data, but not which one is and isnt AD.
+There is Tau/AB info. We use that. To be sure; we decided to only take the lowest (control) and highest quartile(AD).
+```{r, clinical dayon,warning=FALSE,  class.source = 'fold-hide'}
+#Dayon clinical Data
+DayonClinical <- read_excel("Datasets/DayonClinical.xlsx", 
+    col_types = c("text", "numeric", "numeric", 
+        "numeric", "numeric", "numeric"))
+
+#calculate ratio, sort, split in four, select upper and lower
+DayonClincalQuantiles <- DayonClinical %>%
+  mutate(ratioABTAU = CSF_PTAU/CSF_AB42) %>%
+  arrange(ratioABTAU) %>%
+  mutate(quantile = ntile(ratioABTAU, 4)) %>%
+  dplyr::filter(quantile %in% c(1,4)) %>%
+  mutate(DX = ifelse(quantile == 1, "C", "AD"))
+
+Dayonproteinclinical <- left_join(DayonClincalQuantiles, Dayon_protein_clean_averaged, by = c("Subject ID" = "Sample"), keep = TRUE) %>%
+  select(ID, Sample, DX, Intensity)
+```
+
+#### Outlier Selection
+```{r, outlier Dayon, class.source = 'fold-hide'}
+Dayonproteinclinical_NO <- OutlierRemover(Dayonproteinclinical, "Dayon")
+```
+
+#### T-test
+```{r, ttest Dayon, class.source = 'fold-hide'}
+Dayon_ttest <- Ttest_AD(Dayonproteinclinical) %>%
+  dplyr::mutate(FC = estimate1 - estimate2) %>%
+  dplyr::select(ID, FC, p.adj)
+
+# put CSV, XLS, and PDF in a collection
+DT::datatable(Dayon_ttest, extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = list('copy', 'print', list(extend = 'collection',
+        buttons = c('csv', 'excel'),text = 'Download' ))))
+```
+
+Ttest_AD
+
+### Omar
+
+#### Normalization
+We normalize on reference samples. These have the substring Ref (or Rof.. Again, small writing mistake)
+We do work on un-log transformed data here.
+```{r, normalize Omar, class.source = 'fold-hide'}
+#First calculate per sample the median intensity.
+#Then take the mean of all those medians.
+Omar_protein_clean_references <- 
+  Omar_protein_clean %>%
+  mutate(Intensity = 2^Intensity) %>%
+  dplyr::filter(grepl('Ref|Rof', Sample)) %>%
+  group_by(Sample) %>%
+  summarise(PerSampleMedian = median(Intensity, na.rm = TRUE)) %>%
+  ungroup() %>%
+  summarise(AverageMedian = mean(PerSampleMedian))
+Omar_averagemedianofreferences <- mean(Omar_protein_clean_references$AverageMedian)
+
+#Only select samples, calculate median per sample.
+#Determine per sample normalization factor
+#apply it to intensity column. 
+#clean up.
+Omar_protein_clean_noreferences <- 
+  Omar_protein_clean %>%
+  mutate(Intensity = 2^Intensity)%>%
+  dplyr::filter(!grepl('Bool|SP', Sample)) %>%
+  group_by(Sample) %>%
+  mutate(PerSampleMedian = median(Intensity, na.rm = TRUE)) %>%
+  mutate(NormalizeFactor = Omar_averagemedianofreferences/ PerSampleMedian) %>%
+  mutate(Intensity = Intensity * NormalizeFactor) %>%
+  ungroup() %>%
+  mutate(Intensity = log2(Intensity)) %>%
+  select(ID, Sample, Intensity)
+```
+
+#### mean calculation
+This dataset had duplicates. We take average of each.
+Made a small mistake by not applying underscore everywhere. Remove it to solve the issue.
+```{r, mean calculation omar, class.source = 'fold-hide'}
+#split sample name
+#group sample_a and ID
+#Replace intensity by mean of the two.
+#only take one of the two.
+#remove NaN's, clean up columns
+Omar_protein_clean_averaged <- 
+Omar_protein_clean_noreferences %>%
+  mutate(Sample = str_remove_all(Sample, "_")) %>%
+  mutate(sample_b = substr(Sample, 3, 3)) %>% #260160 rows 
+  mutate(Sample = str_to_title(substr(Sample, 1,2))) %>%
+  group_by(Sample, ID) %>%
+  mutate(Intensity = mean(Intensity, na.rm = TRUE)) %>%
+  dplyr::filter(sample_b == "1") %>%
+  na_if("NaN") %>%
+  select(ID, Sample, Intensity)
+```
+
+#### Clinical
+This dataset had AD, control and PSP. Only take AD and Control.
+```{r, add clinical info omar, class.source = 'fold-hide'}
+Omarproteinclinical <- Omar_protein_clean_averaged %>%
+  dplyr::filter(grepl('A|C', Sample)) %>% 
+  mutate(sample_b = substr(Sample, 1, 1)) %>%
+  mutate(DX = ifelse(sample_b == "A", "AD", "C")) %>%
+  select(ID, Sample, DX, Intensity)
+```
+
+#### Outlier Selection
+```{r, outlier selection omar, class.source = 'fold-hide'}
+Omarproteinclinical_NO <- OutlierRemover(Omarproteinclinical, "Omar")
+```
+
+#### T-test
+```{r, ttest Omar, class.source = 'fold-hide'}
+omar_ttest <- Ttest_AD(Omarproteinclinical_NO) %>%
+  dplyr::mutate(FC = estimate1 - estimate2) %>%
+  dplyr::select(ID, FC, p.adj)
+
+# put CSV, XLS, and PDF in a collection
+DT::datatable(omar_ttest, extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = list('copy', 'print', list(extend = 'collection',
+        buttons = c('csv', 'excel'),text = 'Download' ))))
+```
+
+### Sathe
+
+#### Normalization
+We determine the summed intensity (un-transformed) of each sample.
+We take the median value of all those summed intensities and use that for normalization.
+```{r, normalization sathe , class.source = 'fold-hide'}
+Sathe_medianSummedIntensity <- mean((
+  Sathe_protein_clean %>%
+  mutate_all(~replace(., . == 0, NA)) %>%
+  group_by(Sample) %>%
+  summarise(PerSampleSum = sum(Intensity, na.rm = TRUE)) %>%
+  ungroup() %>%
+  summarise(medianOfSummedIntensities = median(PerSampleSum)))$medianOfSummedIntensities)
+
+Sathe_protein_normalized <-   
+Sathe_protein_clean %>%
+  group_by(Sample) %>%
+  mutate(PerSampleSum = sum(Intensity, na.rm = TRUE)) %>%
+  mutate(NormalizeFactor = Sathe_medianSummedIntensity/ PerSampleSum) %>%
+  mutate(Intensity = Intensity * NormalizeFactor) %>%
+  ungroup() %>%
+  select(ID, Sample, Intensity) %>%
+  mutate_all(~replace(., . == 0, NA)) %>%
+  mutate(Intensity = log2(Intensity))
+```
+
+
+#### Mean Calculation
+This dataset had duplicates. We take average of each.
+```{r, mean sathe, class.source = 'fold-hide'}
+#clean and split sample name
+#Replace intensity by mean of the two.
+#only take one of the two.
+#remove NaN's, clean up columns
+Sathe_protein_clean_averaged <- 
+  Sathe_protein_clean %>%
+  separate(Sample, c("Sample", "second")) %>%
+  group_by(Sample, ID) %>%
+  mutate(Intensity = mean(Intensity, na.rm = TRUE)) %>%
+  dplyr::filter(second == "1") %>%
+  na_if("NaN") %>%
+  select(ID, Sample, Intensity)
+```
+
+#### Clinical
+clinical variables were described in manuscript. We extract it from TMT label.
+```{r clinical sathe, , class.source = 'fold-hide'}
+Satheproteinclinical <- 
+  Sathe_protein_clean_averaged %>%
+  mutate(AD= grepl("C",Sample)) %>%
+  mutate(DX = ifelse(AD == TRUE, "C", "AD")) %>%
+  select(ID, Sample, DX, Intensity)
+```
+
+
+#### Outlier Selection
+```{r, outlier selection sathe, class.source = 'fold-hide'}
+Satheproteinclinical_NO <- OutlierRemover(Satheproteinclinical, "Sathe")
+```
+
+
+#### T-test
+```{r, ttest sathe, class.source = 'fold-hide'}
+sathe_ttest <- Ttest_AD(Satheproteinclinical_NO) %>%
+  dplyr::mutate(FC = estimate1 - estimate2) %>%
+  dplyr::select(ID, FC, p.adj)
+
+# put CSV, XLS, and PDF in a collection
+DT::datatable(sathe_ttest, extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = list('copy', 'print', list(extend = 'collection',
+        buttons = c('csv', 'excel'),text = 'Download' ))))
+```
+
+### Lleo
+
+#### Normalization
+We determine the summed intensity (un-transformed) of each sample.
+We take the median value of all those summed intensities and use that for normalization
+```{r, normalization lleo , class.source = 'fold-hide'}
+Lleo_medianSummedIntensity <- mean(
+  (Lleo_protein_clean %>%
+  mutate_all(~replace(., . == 0, NA)) %>%
+  group_by(Sample) %>%
+  summarise(PerSampleSum = sum(Intensity, na.rm = TRUE)) %>%
+  ungroup() %>%
+  summarise(medianOfSummedIntensities = median(PerSampleSum)))$medianOfSummedIntensities
+  )
+
+Lleo_protein_normalized <-   
+Lleo_protein_clean %>%
+  group_by(Sample) %>%
+  mutate(PerSampleSum = sum(Intensity, na.rm = TRUE)) %>%
+  mutate(NormalizeFactor = Lleo_medianSummedIntensity/ PerSampleSum) %>%
+  mutate(Intensity = Intensity * NormalizeFactor) %>%
+  ungroup() %>%
+  select(ID, Sample, Intensity) %>%
+  mutate_all(~replace(., . == 0, NA)) %>%
+  mutate(Intensity = log2(Intensity))
+```
+
+#### Clinical
+This dataset only has four samples. One is AD and 3 control.
+01_01 --> AD1
+02_02 --> C1
+01_02 --> C4
+02_01 --> C5
+Each sample is the POOL of 10 samples.
+```{r, clinical  lleo , class.source = 'fold-hide'}
+Lleoproteinclinical <- Lleo_protein_normalized %>%
+  mutate(Sample = str_remove_all(Sample, " MaxLFQ Total Intensity")) %>%
+  mutate(DX = ifelse(Sample == "01_01", "AD", "C")) %>%
+  select(ID, Sample, DX, Intensity)
+```
+
+#### Outlier Selection
+```{r, outlier selection lleo, class.source = 'fold-hide'}
+Lleoproteinclinical_NO <- OutlierRemover(Lleoproteinclinical, "Lleo")
+```
+
+#### T-test
+Not available in Lleo data due to single AD sample.
+
+### Khoonsari
+
+#### Normalization
+We determine the summed intensity (un-transformed) of each sample.
+We take the median value of all those summed intensities and use that for normalization
+```{r, normalization khoonsari , class.source = 'fold-hide'}
+Khoonsari_medianSummedIntensity <- mean(
+  (Khoonsari_protein_clean %>%
+  mutate_all(~replace(., . == 0, NA)) %>%
+  group_by(Sample) %>%
+  summarise(PerSampleSum = sum(Intensity, na.rm = TRUE)) %>%
+  ungroup() %>%
+  summarise(medianOfSummedIntensities = median(PerSampleSum)))$medianOfSummedIntensities
+  )
+
+Khoonsari_protein_normalized <-   
+Khoonsari_protein_clean %>%
+  group_by(Sample) %>%
+  mutate(PerSampleSum = sum(Intensity, na.rm = TRUE)) %>%
+  mutate(NormalizeFactor = Khoonsari_medianSummedIntensity/ PerSampleSum) %>%
+  mutate(Intensity = Intensity * NormalizeFactor) %>%
+  ungroup() %>%
+  select(ID, Sample, Intensity) %>%
+  mutate_all(~replace(., . == 0, NA)) %>%
+  mutate(Intensity = log2(Intensity))
+```
+
+#### Mean Calculation
+
+This dataset had duplicates. We take average of each.
+```{r, mean khoonsari, warning=FALSE , class.source = 'fold-hide'}
+#clean and split sample name
+#Replace intensity by mean of the two.
+#only take one of the two.
+#remove NaN's, clean up columns
+Khoonsari_protein_clean_averaged <- 
+  Khoonsari_protein_normalized %>%
+  mutate(Sample = str_remove_all(Sample, " Total Intensity")) %>%
+  separate(Sample, c("Sample", "second")) %>%
+  group_by(Sample, ID) %>%
+  mutate(Intensity = mean(Intensity, na.rm = TRUE)) %>%
+  dplyr::filter(second == "1") %>%
+  na_if("NaN") %>%
+  select(ID, Sample, Intensity)
+```
+
+#### Clinical
+clinical data in rawfile name.
+```{r, clinical khoonsari , class.source = 'fold-hide'}
+Khoonsariproteinclinical <-
+Khoonsari_protein_clean_averaged %>%
+  mutate(AD= grepl("AD",Sample)) %>%
+  mutate(DX = ifelse(AD == TRUE, "AD", "C")) %>%
+  select(ID, Sample, DX, Intensity)
+```
+
+
+#### Outlier Selection
+```{r, outlier selection khoonsari, class.source = 'fold-hide'}
+Khoonsariproteinclinical_NO <- OutlierRemover(Khoonsariproteinclinical, "Khoonsari")
+```
+
+#### T-test
+```{r, ttest khoonsari, class.source = 'fold-hide'}
+khoonsari_ttest <- Ttest_AD(Khoonsariproteinclinical_NO) %>%
+  dplyr::mutate(FC = estimate1 - estimate2) %>%
+  dplyr::select(ID, FC, p.adj)
+
+# put CSV, XLS, and PDF in a collection
+DT::datatable(khoonsari_ttest, extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = list('copy', 'print', list(extend = 'collection',
+        buttons = c('csv', 'excel'),text = 'Download' ))))
+```
+
+### Multhaup
+
+#### Normalization
+We determine the summed intensity (un-transformed) of each sample.
+We take the median value of all those summed intensities and use that for normalization
+```{r, normalize multhaup , class.source = 'fold-hide'}
+Multhaup_medianSummedIntensity <- mean(
+  (Multhaup_protein_clean %>%
+  mutate_all(~replace(., . == 0, NA)) %>%
+  group_by(Sample) %>%
+  summarise(PerSampleSum = sum(Intensity, na.rm = TRUE)) %>%
+  ungroup() %>%
+  summarise(medianOfSummedIntensities = median(PerSampleSum)))$medianOfSummedIntensities
+  )
+
+Multhaup_protein_normalized <-   
+Multhaup_protein_clean %>%
+  group_by(Sample) %>%
+  mutate(PerSampleSum = sum(Intensity, na.rm = TRUE)) %>%
+  mutate(NormalizeFactor = Multhaup_medianSummedIntensity/ PerSampleSum) %>%
+  mutate(Intensity = Intensity * NormalizeFactor) %>%
+  ungroup() %>%
+  select(ID, Sample, Intensity) %>%
+  mutate_all(~replace(., . == 0, NA)) %>%
+  mutate(Intensity = log2(Intensity))
+```
+
+#### Clinical
+Clinical info is in the raw file name.
+```{r, clinical multhaup , class.source = 'fold-hide'}
+Multhaupproteinclinical <-
+Multhaup_protein_normalized %>%
+  mutate(Sample = str_remove_all(Sample, " MaxLFQ Total Intensity")) %>%
+  mutate(NAD= grepl("NAD",Sample)) %>%
+  mutate(DX = ifelse(NAD == TRUE, "C", "AD")) %>%
+  select(ID, Sample, DX, Intensity)
+```
+
+
+#### Outlier Selection
+```{r, outlier selection Multhaup, class.source = 'fold-hide'}
+Multhaupproteinclinical_NO <- OutlierRemover(Multhaupproteinclinical, "Multhaup")
+```
+
+
+#### T-test
+```{r, ttest multhaup, class.source = 'fold-hide'}
+multhaup_ttest <- Ttest_AD(Multhaupproteinclinical_NO) %>%
+  dplyr::mutate(FC = estimate1 - estimate2) %>%
+  dplyr::select(ID, FC, p.adj)
+
+# put CSV, XLS, and PDF in a collection
+DT::datatable(multhaup_ttest, extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = list('copy', 'print', list(extend = 'collection',
+        buttons = c('csv', 'excel'),text = 'Download' ))))
+```
+
+### Wang
+
+
+#### Normalization
+We determine the summed intensity (un-transformed) of each sample.
+We take the median value of all those summed intensities and use that for normalization
+```{r, normalize wang , class.source = 'fold-hide'}
+Wang_medianSummedIntensity <- mean(
+  (Wang_protein_clean %>%
+  mutate_all(~replace(., . == 0, NA)) %>%
+  group_by(Sample) %>%
+  summarise(PerSampleSum = sum(Intensity, na.rm = TRUE)) %>%
+  ungroup() %>%
+  summarise(medianOfSummedIntensities = median(PerSampleSum)))$medianOfSummedIntensities
+  )
+
+Wang_protein_normalized <-   
+Wang_protein_clean %>%
+  group_by(Sample) %>%
+  mutate(PerSampleSum = sum(Intensity, na.rm = TRUE)) %>%
+  mutate(NormalizeFactor = Wang_medianSummedIntensity/ PerSampleSum) %>%
+  mutate(Intensity = Intensity * NormalizeFactor) %>%
+  ungroup() %>%
+  select(ID, Sample, Intensity) %>%
+  mutate_all(~replace(., . == 0, NA)) %>%
+  mutate(Intensity = log2(Intensity))
+```
+
+#### Mean Calculation
+
+This dataset had Triplicates We take average of each.
+```{r, mean wang , warning=FALSE, class.source = 'fold-hide'}
+#clean and split sample name
+#Replace intensity by mean of the two.
+#only take one of the two.
+#remove NaN's, clean up columns
+Wang_protein_clean_averaged <- 
+  Wang_protein_normalized %>%
+  mutate(Sample = str_remove_all(Sample, " Total Intensity")) %>%
+  separate(Sample, c("Sample", "second", "third", "fourth")) %>%
+  mutate(Sample = paste(Sample, second,third, sep = "_")) %>%
+  group_by(Sample, ID) %>%
+  mutate(Intensity = mean(Intensity, na.rm = TRUE)) %>%
+  dplyr::filter(fourth == "1") %>%
+  na_if("NaN") %>%
+  select(ID, Sample, Intensity)
+```
+
+#### Clinical
+Clinical data given by group over email by Wang group.
+```{r, clinical wang , class.source = 'fold-hide'}
+Wang_Clinical <- read_excel("Datasets/Wang_Clinical.xlsx")
+Wang_Clinical$Sample <- as.character(Wang_Clinical$Sample)
+
+#Split again for matching with excel table
+Wang_protein_clean_averaged <- Wang_protein_clean_averaged %>%
+   separate(Sample, c("first", "second", "third"), remove = F) 
+
+Wangproteinclinical <-
+left_join(Wang_Clinical, Wang_protein_clean_averaged, by = c("Sample" = "third")) %>%
+  mutate(Sample = Sample.y) %>%
+  dplyr::filter(!DX == "MCI") %>%
+  select(ID, Sample, DX, Intensity)
+```
+
+
+#### Outlier Selection
+```{r, outlier selection Wang, class.source = 'fold-hide'}
+Wangproteinclinical_NO <- OutlierRemover(Wangproteinclinical, "Wang")
+```
+
+#### T-test
+```{r, ttest wang, class.source = 'fold-hide'}
+wang_ttest <- Ttest_AD(Wangproteinclinical_NO) %>%
+  dplyr::mutate(FC = estimate1 - estimate2) %>%
+  dplyr::select(ID, FC, p.adj)
+
+# put CSV, XLS, and PDF in a collection
+DT::datatable(wang_ttest, extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = list('copy', 'print', list(extend = 'collection',
+        buttons = c('csv', 'excel'),text = 'Download' ))))
+```
+
+
+## Combining data & Z-scoring of Data
+Add an identifier to each dataset, Z-score the data, combine the data (once for un-transformed, once for z-scored).
+```{r, combine all data, class.source = 'fold-hide'}
+Dayonproteinclinical_NO$Dataset <- "Dayon"
+Omarproteinclinical_NO$Dataset <- "In-house"
+Satheproteinclinical_NO$Dataset <- "Sathe"
+Lleoproteinclinical_NO$Dataset <- "Lleó"
+Khoonsariproteinclinical_NO$Dataset <- "Khoonsari"
+Multhaupproteinclinical_NO$Dataset <- "Barucker"
+Wangproteinclinical_NO$Dataset <- "Wang"
+
+Allproteinclinical <- rbind(Dayonproteinclinical_NO,
+                            Omarproteinclinical_NO,
+                            Satheproteinclinical_NO,
+                            Lleoproteinclinical_NO,
+                            Khoonsariproteinclinical_NO,
+                            Multhaupproteinclinical_NO,
+                            Wangproteinclinical_NO)
+
+#Function to Z-score Data
+Z_Scorer <- function(dataset){
+
+  MeanSD_DF <- dataset %>%
+    group_by(ID) %>%
+    filter(DX == "C") %>%
+    summarise(mean = mean(Intensity, na.rm = T),
+              sd = sd(Intensity, na.rm=T))
+  
+  Zscored <- left_join(dataset, MeanSD_DF, by = c("ID" = "ID")) %>%
+    mutate(Z_score = (Intensity - mean)/sd) %>%
+    dplyr::select(ID, Sample, DX, Z_score, Dataset)
+  
+  return(Zscored)
+}
+
+Dayonproteinclinical_Zscore <- Z_Scorer(Dayonproteinclinical_NO)
+Omarproteinclinical_Zscore <- Z_Scorer(Omarproteinclinical_NO)
+Satheproteinclinical_Zscore <- Z_Scorer(Satheproteinclinical_NO)
+Lleoproteinclinical_Zscore <- Z_Scorer(Lleoproteinclinical_NO)
+Khoonsariproteinclinical_Zscore <- Z_Scorer(Khoonsariproteinclinical_NO)
+Multhaupproteinclinical_Zscore <- Z_Scorer(Multhaupproteinclinical_NO)
+Wangproteinclinical_Zscore <- Z_Scorer(Wangproteinclinical_NO)
+
+Allproteinclinical_Zscored <- rbind(Dayonproteinclinical_Zscore,
+                            Omarproteinclinical_Zscore,
+                            Satheproteinclinical_Zscore,
+                            Lleoproteinclinical_Zscore,
+                            Khoonsariproteinclinical_Zscore,
+                            Multhaupproteinclinical_Zscore,
+                            Wangproteinclinical_Zscore)
+```
+
+## PCA Plots before After Z-scoring
+To see the effect of Z-scoring we make a PCA plot before and after.
+```{r, pcaplots, class.source = 'fold-hide', fig.width=8, fig.height=4}
+PCA_PLOT <- function(dataset, dataset2) {
+  
+  #PCA PLOT: 70% cut off
+  ProteinsToKeep <- dataset %>%
+    group_by(ID) %>%
+    summarise(PercentMissing = sum(!is.na(Intensity))/ length(unique(dataset$Sample))) %>%
+    mutate(remove = PercentMissing > 0.7) %>%
+    dplyr::filter(remove == T)
+    
+  #Half minimum value (per protein) imputation
+  #We do a spread gather repeat to create rows because for some proteins there was not even a row hence we cant impute it.
+  PCA_DF <-
+  dataset %>% 
+    dplyr::filter(ID %in% ProteinsToKeep$ID) %>%
+    group_by(ID) %>%
+    spread(key = "ID", value = "Intensity") %>%
+    gather(key = "ID", value = "Intensity", unique(ProteinsToKeep$ID)) %>%
+    mutate(IntensImputed = replace_na(Intensity, mean(Intensity, na.rm = T)/2)) %>%
+    mutate(SampleDX = paste0(Sample,"/", DX, "/", Dataset)) %>%
+    select(ID, SampleDX, IntensImputed) %>%
+    spread(key = "ID", value = "IntensImputed") %>%
+    column_to_rownames("SampleDX")
+
+  #scale and PCA
+  PCA_DF_Results <- prcomp(as.matrix(PCA_DF))
+  eigs <- PCA_DF_Results$sdev^2
+  variance_percentage <- (eigs / sum(eigs))*100
+  pc1var <- round(variance_percentage[1],digits=0)
+  pc2var <- round(variance_percentage[2],digits=0)
+  
+  #Plot
+  plot1 <- data.frame(PCA_DF_Results$x) %>%
+    rownames_to_column() %>%
+    separate(rowname, c("Sample", "DX", "Dataset"), "/") %>%
+    ggplot(aes(x = PC1, y = PC2, fill = Dataset)) +
+    geom_point(size = 3, shape = 21) +
+    theme_pubr() +
+    theme(text = element_text(family="serif")) +
+    xlim(-100, 100) +
+    ylim(-100, 50) +
+    scale_fill_few("Dark") +
+    xlab(paste('PC1',' (',pc1var,'% variance)',sep='')) +
+    ylab(paste('PC2',' (',pc2var,'% variance)',sep='')) 
+  
+  
+  #Half minimum value (per protein) imputation
+  #We do a spread gather repeat to create rows because for some proteins there was not even a row hence we cant impute it.
+  PCA_DF <-
+  dataset2 %>% 
+    dplyr::filter(ID %in% ProteinsToKeep$ID) %>%
+    group_by(ID) %>%
+    spread(key = "ID", value = "Z_score") %>%
+    gather(key = "ID", value = "Z_score", unique(ProteinsToKeep$ID)) %>%
+    mutate(IntensImputed = replace_na(Z_score, mean(Z_score, na.rm = T)/2)) %>%
+    mutate(SampleDX = paste0(Sample,"/", DX, "/", Dataset)) %>%
+    select(ID, SampleDX, IntensImputed) %>%
+    spread(key = "ID", value = "IntensImputed") %>%
+    column_to_rownames("SampleDX")
+
+  #scale and PCA
+  PCA_DF_Results <- prcomp(as.matrix(PCA_DF))
+  eigs <- PCA_DF_Results$sdev^2
+  variance_percentage <- (eigs / sum(eigs))*100
+  pc1var <- round(variance_percentage[1],digits=0)
+  pc2var <- round(variance_percentage[2],digits=0)
+  
+  #Plot
+  plot2 <- data.frame(PCA_DF_Results$x) %>%
+    rownames_to_column() %>%
+    separate(rowname, c("Sample", "DX", "Dataset"), "/") %>%
+    ggplot(aes(x = PC1, y = PC2, fill = Dataset)) +
+    geom_point(size = 3, shape = 21) +
+    theme_pubr() +
+    theme(text = element_text(family="serif")) +
+    xlim(-100, 100) +
+    ylim(-100, 50) +
+    scale_fill_few("Dark") + 
+    xlab(paste('PC1',' (',pc1var,'% variance)',sep='')) +
+    ylab(paste('PC2',' (',pc2var,'% variance)',sep='')) 
+   
+  plot(ggarrange(plot1, plot2, common.legend = T, legend = T))
+   
+}
+
+PCA_PLOT_BeforeAfter <- PCA_PLOT(Allproteinclinical , Allproteinclinical_Zscored)
+```
+
+
+## T-test combined Dataset
+Apply 70% cut off, run a T-test with Benjamini Hochberg Correction.
+```{r, Volcano_combined, warning=FALSE, class.source = 'fold-hide', fig.width=6, fig.height=6}
+
+Allproteinclinical_Zscored <- Allproteinclinical_Zscored %>%
+   mutate(SampleDX = paste0(Sample,"/", DX, "/", Dataset))
+
+ProteinsToKeep_all <- Allproteinclinical_Zscored %>%
+    group_by(ID) %>%
+    summarise(PercentMissing = sum(!is.na(Z_score))/ length(unique(Allproteinclinical_Zscored$SampleDX))) %>%
+    mutate(remove = PercentMissing > 0.7) %>%
+    dplyr::filter(remove == T)
+
+Tttest_all <- Allproteinclinical_Zscored %>%
+  dplyr::filter(ID %in% ProteinsToKeep_all$ID) %>%
+    drop_na(Z_score) %>%
+    drop_na(DX) %>%
+    group_by(ID) %>%
+    wilcox_test(Z_score ~ DX, detailed = T) %>%
+    adjust_pvalue(method = "BH") %>%
+  mutate(SIGNIFICANT = p.adj < 0.05) %>%
+  mutate(log10_padj = -1*log10(p.adj))
+
+Tttest_all <- Tttest_all %>%
+  separate(ID, c("UniProt", "Gene"), remove = F)
+  
+VolcanoAll <- Tttest_all %>%
+  ggplot(aes(x = estimate, y = log10_padj, fill = SIGNIFICANT)) + 
+  geom_point(size = 3, shape = 21) +
+  geom_text_repel(aes(label = Gene), data = Tttest_all[Tttest_all$p.adj < 0.05,], box.padding = 0.5, max.overlaps = Inf) +
+  scale_fill_manual(values = c("darkgrey", "darkred")) +
+  theme_pubr() +
+  geom_hline(yintercept = 1.3, linetype = 2, alpha = 0.7) +
+    xlim(-2.2,2.2)+
+    xlab("Z-score") +
+    ylab("-log10(adjusted p-value)") +
+  theme(legend.position= "none") +
+  theme(text = element_text(family="serif"))
+
+plot(VolcanoAll)
+
+Tttest_allDT <- Tttest_all %>%
+  dplyr::mutate(FC = estimate) %>%
+  dplyr::select(ID, FC, p.adj)
+
+
+# put CSV, XLS, and PDF in a collection
+DT::datatable(Tttest_allDT, extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = list('copy', 'print', list(extend = 'collection',
+        buttons = c('csv', 'excel'),text = 'Download' ))))
+```
+
+## Heatmap Combined vs. Single.
+Join all the dataframes for the siginificant proteins in the combined dataset to compare with the statistics of single datasets.
+```{r, joined Heatmap, class.source = 'fold-hide'}
+SignificantHits <- Tttest_all %>%
+  dplyr::filter(SIGNIFICANT == T)
+
+HeatmapDF <- left_join(
+    left_join(
+      left_join(
+        left_join(
+          left_join(
+            left_join(Dayon_ttest %>%
+            filter(ID %in% SignificantHits$ID) %>%
+            separate(ID, c("UniProt", "Gene"), remove = F) %>%
+            mutate(Dayon = -1*log10(as.numeric(p.adj))) %>%
+            select(Gene, Dayon),
+            sathe_ttest %>%
+            filter(ID %in% SignificantHits$ID) %>%
+            separate(ID, c("UniProt", "Gene"), remove = F) %>%
+            mutate(Sathe = -1*log10(as.numeric(p.adj))) %>%
+            select(Gene, Sathe),
+            by = c("Gene" = "Gene")),
+            khoonsari_ttest %>%
+            filter(ID %in% SignificantHits$ID) %>%
+            separate(ID, c("UniProt", "Gene"), remove = F) %>%
+            mutate(Khoonsari = -1*log10(as.numeric(p.adj))) %>%
+            select(Gene, Khoonsari),
+          by = c("Gene" = "Gene")),
+            multhaup_ttest %>%
+            filter(ID %in% SignificantHits$ID) %>%
+            separate(ID, c("UniProt", "Gene"), remove = F) %>%
+            mutate(Barucker = -1*log10(as.numeric(p.adj))) %>%
+            select(Gene, Barucker),
+          by = c("Gene" = "Gene")),
+    wang_ttest %>%
+    filter(ID %in% SignificantHits$ID) %>%
+    separate(ID, c("UniProt", "Gene"), remove = F) %>%
+    mutate(Wang = -1*log10(as.numeric(p.adj))) %>%
+    select(Gene, Wang),
+  by = c("Gene" = "Gene")),
+    omar_ttest %>%
+    filter(ID %in% SignificantHits$ID) %>%
+    separate(ID, c("UniProt", "Gene"), remove = F) %>%
+    mutate(In_house = -1*log10(as.numeric(p.adj))) %>%
+    select(Gene, In_house),
+  by = c("Gene" = "Gene")),
+    Tttest_all %>%
+    filter(ID %in% SignificantHits$ID) %>%
+    separate(ID, c("UniProt", "Gene"), remove = F) %>%
+    mutate(Meta = -1*log10(as.numeric(p.adj))) %>%
+    select(Gene, Meta),
+  by = c("Gene" = "Gene")) %>%
+  arrange(Gene = desc(Meta)) %>%
+  column_to_rownames("Gene")
+
+col_fun = colorRamp2(c(0, 1.3, 4, 8), c("white","#E6AC0E", "#DE4203", "#840602"))
+lgd = Legend(col_fun = col_fun, title = "-log10(adjusted p-value)")
+Heatmap_ALL <- Heatmap(as.matrix(HeatmapDF),
+        col = col_fun,
+        cluster_rows = F,
+        cluster_columns = F,
+        row_names_side = c("left"),
+        rect_gp = gpar(col = "black", lwd = 2.5),
+        width = ncol(HeatmapDF)*unit(5, "mm"),
+        height = nrow(HeatmapDF)*unit(5, "mm"),
+        heatmap_legend_param = list(title = "-log10(adjusted p value)",
+                                    legend_height = unit(4, "cm"),
+                                    title_position = "lefttop-rot"))
+
+plot(Heatmap_ALL)
+```
+
+## msgidb Hallmark Enrichment
+Use the msgidb Hallmark enrichment dataset to see what proteins are affected in our combined dataset.
+```{r, Hallmark, class.source = 'fold-hide'}
+SignificantHits <- Tttest_all %>% 
+  dplyr::filter(SIGNIFICANT == T) 
+
+all_gene_sets = msigdbr(species = "Homo sapiens", category = "H")
+msigdbr_t2g = all_gene_sets %>%
+  dplyr::distinct(gs_name, gene_symbol) %>%
+  mutate(gs_name = str_remove_all(gs_name, "HALLMARK_")) %>% #REMOVE ALL THE HALLMARK STUFF
+  as.data.frame()
+
+enrichResults <- enricher(gene = SignificantHits$Gene, TERM2GENE = msigdbr_t2g)
+
+#clusterProfiler::dotplot(enrichResults)
+
+HallMarkPlot <- cnetplot(enrichResults, cex_category = 2, cex_label_category = 1, cex__label_gene = 1) +
+  scale_color_manual(values = c("#3B9AB2", "#F21A00")) +
+  theme(legend.position = "none") +
+  theme(text = element_text(family="serif"))
+  
+plot(HallMarkPlot)
+```
+
+## KEGG Enrichment
+Use the KEGG enrichment dataset to see what proteins are affected in our combined dataset.
+```{r, kegg enrichment, warning=FALSE, class.source = 'fold-hide'}
+#Enrich for each colour
+enrichtments <- enrichR::enrichr(SignificantHits$Gene,
+                              c("KEGG_2021_Human"))
+
+myPalette <-colorRampPalette(rev(RColorBrewer::brewer.pal(11, "Spectral")))
+sc <- scale_colour_gradientn(colours = myPalette(100), limits=c(0.0, 0.02))
+
+KeggPlot <- enrichtments$KEGG_2021_Human %>%
+  slice_head(n = 10) %>%
+  mutate_at("Term", str_trunc, width = 45) %>%
+  select(Term, Genes, Adjusted.P.value, Overlap) %>%
+  mutate(KeggPathway = fct_reorder(Term, Adjusted.P.value, .desc = T)) %>%
+  separate(Overlap, c("Count", "All")) %>%
+  mutate(GeneRatio = as.numeric(Count)/ as.numeric(All)) %>%
+  mutate(Count = as.numeric(Count)) %>%
+  ggplot(aes(x = GeneRatio, y = KeggPathway, colour = Adjusted.P.value, )) +
+  geom_point(aes(size=Count)) +
+  scale_colour_gradient(low = "red", high = "darkblue") +
+  theme_pubr() +
+  theme(legend.position = "right") +
+  theme(text = element_text(family="serif"))
+  
+plot(KeggPlot)
+```
+
+
+# 2. Pruning
+This dataset (10 AD, 10 Control) was created in-house.
+
+### Normalization
+We determine the summed intensity (un-transformed) of each sample.
+We take the median value of all those summed intensities and use that for normalization.
+```{r, Pruning dataset normalize, class.source = 'fold-hide'}
+Zetterberg_medianSummedIntensity <- mean((
+  Zetterberg_protein_clean %>%
+  mutate_all(~replace(., . == 0, NA)) %>%
+  group_by(Sample) %>%
+  summarise(PerSampleSum = sum(Intensity, na.rm = TRUE)) %>%
+  ungroup() %>%
+  summarise(medianOfSummedIntensities = median(PerSampleSum)))$medianOfSummedIntensities)
+
+Zetterberg_protein_normalized <-   
+Zetterberg_protein_clean %>%
+  group_by(Sample) %>%
+  mutate(PerSampleSum = sum(Intensity, na.rm = TRUE)) %>%
+  mutate(NormalizeFactor = Zetterberg_medianSummedIntensity/ PerSampleSum) %>%
+  mutate(Intensity = Intensity * NormalizeFactor) %>%
+  ungroup() %>%
+  select(ID, Sample, Intensity) %>%
+  mutate_all(~replace(., . == 0, NA)) %>%
+  mutate(Intensity = log2(Intensity))
+```
+
+### Outlier Selection
+```{r, Pruning dataset add clinical, warning=FALSE, class.source = 'fold-hide'}
+#Add with Clinical
+Zetterberg_protein_normalized <- Zetterberg_protein_normalized %>%
+  separate(Sample, c("first", "second", "third", "fourth", "Sample")) %>%
+  select(ID, Sample, Intensity)
+
+Zetterberg_Clinical <- read_excel("Datasets/Zetterberg_Clinical.xlsx")
+
+Zetterbergproteinclinical <- left_join(Zetterberg_Clinical, Zetterberg_protein_normalized, by = c("Sample" = "Sample")) %>%
+  select(ID, Sample, DX, Intensity)
+
+Zetterbergproteinclinical_NO <- OutlierRemover(Zetterbergproteinclinical, "Pruning Dataset")
+```
+
+### T-Test
+```{r, volcano pruning, warning=FALSE, class.source = 'fold-hide', fig.width=6, fig.height=6}
+Ttest_AD_Zscore <- function(dataset){
+  #70% cut off
+  ProteinsToKeep <- dataset %>%
+    group_by(ID) %>%
+    summarise(PercentMissing = sum(!is.na(Z_score))/ length(unique(dataset$Sample))) %>%
+    mutate(remove = PercentMissing > 0.7) %>%
+    dplyr::filter(remove == T)
+
+  dataset_ttest <- dataset %>%
+    filter(ID %in% ProteinsToKeep$ID) %>%
+    drop_na(Z_score) %>%
+    drop_na(DX) %>%
+    group_by(ID) %>%
+    wilcox_test(Z_score ~ DX, detailed = T) %>%
+    adjust_pvalue(method = "BH") %>%
+    mutate(SIGNIFICANT = p.adj < 0.05) %>%
+  mutate(log10_padj = -1*log10(p.adj))
+  
+  return(dataset_ttest)
+}
+Zetterbergproteinclinical_NO$Dataset <- "Pruning"
+Zetterbergproteinclinical_Zscore <- Z_Scorer(Zetterbergproteinclinical_NO)
+Zetterberg_ttest <- Ttest_AD_Zscore(Zetterbergproteinclinical_Zscore)
+  
+Zetterberg_ttest <- Zetterberg_ttest %>%
+  separate(ID, c("UniProt", "Gene"), remove = F)
+
+VolcanoPruning <- Zetterberg_ttest %>%
+  ggplot(aes(x = estimate, y = log10_padj, fill = SIGNIFICANT)) + 
+  geom_point(size = 3, shape = 21) +
+  geom_text_repel(aes(label = Gene), data = Zetterberg_ttest[Zetterberg_ttest$p.adj < 0.05,], max.overlaps = Inf) +
+  scale_fill_manual(values = c("darkgrey", "darkred")) +
+  xlim(-6,6) +
+  theme_pubr() +
+  geom_hline(yintercept = 1.3, linetype = 2, alpha = 0.7) +
+    #xlim(-2.6,2.6)+
+    xlab("Z-score") +
+    ylab("-log10(adjusted p-value)") +
+  theme(legend.position= "none") +
+  theme(text = element_text(family="serif"))
+
+plot(VolcanoPruning)
+
+Zetterberg_ttestDT <- Zetterberg_ttest %>%
+  dplyr::mutate(FC = estimate) %>%
+  dplyr::select(ID, FC, p.adj)
+
+
+# put CSV, XLS, and PDF in a collection
+DT::datatable(Zetterberg_ttestDT, extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = list('copy', 'print', list(extend = 'collection',
+        buttons = c('csv', 'excel'),text = 'Download' ))))
+```
+
+### Venny of All vs Pruning
+```{r, venny prune all,  class.source = 'fold-hide'}
+PruningSignificant <- Zetterberg_ttest %>%
+  filter(p.adj < 0.05)
+
+VennyPruneMeta <- plot(euler(list(
+      "Pruning" = PruningSignificant$Gene,
+      "Discovery" = SignificantHits$Gene),
+    shape = "ellipse"), quantities = T,
+    fills = c("#FC4E07", "#E7B800")
+)
+
+plot(VennyPruneMeta)
+
+```
+
+### BoxPlots Pruning
+We select the three overlapping Markers and visualize in boxplot.
+```{r, boxplotpruning, warning=FALSE, class.source = 'fold-hide'}
+Comparisons <- list(c("AD" , "C"))
+
+Pruning_BoxPlot <- 
+  Zetterbergproteinclinical_Zscore %>%
+  separate(ID, c("UniProt", "Gene"), remove = F) %>%
+  filter(ID %in% c("P04075_ALDOA", "P14618_PKM", "P07195_LDHB")) %>%
+  ggplot(aes(DX, Z_score)) +
+  geom_boxplot(aes(fill = Gene, alpha = DX)) +
+  facet_wrap(. ~ Gene) +
+  scale_alpha_discrete(range = c(1, 0)) +
+  scale_fill_manual(values = c("#1ca375", "#827d9c", "#d15b01")) +
+  theme_pubr() +
+  ylim(-2, 10)+
+  ylab("Z-score") +
+    theme(axis.title.x=element_blank(),
+        legend.position = "none",
+        text = element_text(family="serif"))
+plot(Pruning_BoxPlot)
+```
+
+
+# 3. Validation
+We will use two recent large-scale CSF proteomics datasets that are available. Those datasets were downloaded through the publications Supplementary data respositories. We import them here.
+```{r, import validation, warning=FALSE, class.source = 'fold-hide'}
+Seyfried_DF <- read_excel("Datasets/Seyfried_resultmatrix.xlsx")
+Seyfried_DF[Seyfried_DF == 0] <- NA
+Mann_DF <- read_excel("Datasets/Mann_Matrix.xlsx")
+Mann_DF[Mann_DF == 0] <- NA
+```
+
+## Johnson Data
+Study used DDA TMT on a large cohort (Emory University, USA).
+
+#### Prepare Johnson Data
+Long format it, add AD vs. Control information based on sample names.
+```{r, prepare Johnson, warning=FALSE, message=FALSE, class.source = 'fold-hide'}
+##### SEYFRIED PREPARE
+cl <- colnames(Seyfried_DF[2:ncol(Seyfried_DF)])
+
+Seyfried_resultmatrix <-  Seyfried_DF %>%
+  gather(cl, key = "Sample", value = "Intensity") 
+
+Seyfried_resultmatrix$DX <- grepl("Co", Seyfried_resultmatrix$Sample, fixed = T)
+
+```
+
+#### Boxplots of biomarker candidates 
+```{r, boxplot Johnson, warning=FALSE, class.source = 'fold-hide'}
+Seyfried_BoxPlot <- 
+  Seyfried_resultmatrix %>%
+    filter(rowID %in% c("P04075", "P14618", "P07195")) %>%
+  mutate(Gene = ifelse(rowID == "P04075", "ALDOA", ifelse(rowID == "P14618", "PKM","LDHB"))) %>%
+  mutate(DX = ifelse(DX == TRUE, "C","AD")) %>% 
+  ggplot(aes(DX, Intensity)) +
+  geom_boxplot(aes(fill = Gene, alpha = DX)) +
+  facet_wrap(. ~ Gene) +
+  scale_alpha_discrete(range = c(1, 0)) +
+  scale_fill_manual(values = c("#1ca375", "#827d9c", "#d15b01")) +
+  theme_pubr() +
+  ylim(-1, 1.5) +
+  ylab("Ratio") +
+    theme(axis.title.x=element_blank(),
+        legend.position = "none",
+        text = element_text(family="serif"))
+
+plot(Seyfried_BoxPlot)
+```
+
+
+## Bader Data
+Study used LFQ DIA on CSF samples from three cohorts. 
+
+#### Prepare Bader Data
+Long format it, add AD vs. Control information based on sample names.
+This dataset contains a few (17) isoforms. We average them for downstream analysis.
+```{r, prepare Bader, warning=FALSE, message=FALSE, class.source = 'fold-hide'}
+cl_mann <- colnames(Mann_DF[2:ncol(Mann_DF)])
+
+Mann_resultmatrix <- Mann_DF %>%
+  gather(cl_mann, key = "Sample", value = "Intensity") %>%
+  mutate(Intensity = log2(Intensity))
+
+Mann_resultmatrix$DX <- grepl("Co", Mann_resultmatrix$Sample, fixed = T)
+
+#There is 17 proteins in this dataset where isoforms are specified.
+#To make this data easily applicable to all the others, we average it.
+Mann_resultmatrix <- Mann_resultmatrix %>%
+  group_by(Sample, rowID, DX) %>%
+  summarise(Intensity = mean(Intensity)) 
+```
+
+#### Boxplots of biomarker candidates 
+```{r, boxplot Bader, warning=FALSE, class.source = 'fold-hide'}
+Mann_BoxPlot <- 
+  Mann_resultmatrix %>%
+  filter(rowID %in% c("P04075", "P14618", "P07195")) %>%
+  mutate(Gene = ifelse(rowID == "P04075", "ALDOA", ifelse(rowID == "P14618", "PKM","LDHB"))) %>%
+  mutate(DX = ifelse(DX == TRUE, "C","AD")) %>% 
+  ggplot(aes(DX, Intensity)) +
+  geom_boxplot(aes(fill = Gene, alpha = DX)) +
+  facet_wrap(. ~ Gene) +
+  scale_alpha_discrete(range = c(1, 0)) +
+  scale_fill_manual(values = c("#1ca375", "#827d9c", "#d15b01")) +
+  theme_pubr() +
+  ylim(17.5, 21.5) +
+  ylab("log2(Intensity)") +
+    theme(axis.title.x=element_blank(),
+        legend.position = "none",
+        text = element_text(family="serif"))
+
+plot(Mann_BoxPlot)
+```
+
+## Biomarker Model Development
+
+Using Logistic Regression we develop biomarker panels of the three selected biomarker candidates. We develop a model based on the Johnson Data, and another model on the Seyfried Data. Each model is then tested on both the Johnson and Bader Data. If a model is effective in both datasets we may assume the results is not due to overfitting.
+
+### Model Development 
+
+#### Develop Model Johnson
+```{r, model Johnson , warning=FALSE, class.source = 'fold-hide'}
+Seyfried_ModelDF <- Seyfried_resultmatrix %>%
+ dplyr::filter(rowID %in% c("P04075", "P14618", "P07195")) %>%
+  select(Sample, 'rowID', DX, Intensity) %>%
+  spread(key = "rowID", value = "Intensity")
+
+Seyfried_ModelDF <- data.frame(Seyfried_ModelDF)
+Seyfried_ModelDF$DX <- as.factor(Seyfried_ModelDF$DX)
+
+#Create the Model
+Seyfried_MarkerPanel <- glm(DX ~ P04075 + P14618 + P07195, data = Seyfried_ModelDF, family = 'binomial')
+```
+
+
+#### Develop Model Bader
+```{r, model Bader, warning=FALSE, class.source = 'fold-hide'}
+Mann_ModelDF <- Mann_resultmatrix %>%
+ dplyr::filter(rowID %in% c("P04075", "P14618", "P07195")) %>%
+  select(Sample, 'rowID', DX, Intensity) %>%
+  spread(key = "rowID", value = "Intensity")
+
+Mann_ModelDF$DX <- as.factor(Mann_ModelDF$DX)
+
+#Create the Model
+Mann_MarkerPanel <- glm(DX ~ P04075 + P14618 + P07195, data = Mann_ModelDF, family = 'binomial')
+```
+
+### Model Testing
+
+#### Johnson Data
+
+We observe a similair AUROC for the two models. We can thus assume that the three markers are effective at differentiating AD from Controls, indepedent from potential overfitting.
+
+```{r, roc plot johnson, warning=FALSE, message=FALSE, class.source = 'fold-hide'}
+Seyfried_ModelDF$Seyfried_panel <- predict(Seyfried_MarkerPanel, Seyfried_ModelDF)
+Seyfried_ModelDF$Mann_panel <- predict(Mann_MarkerPanel, Seyfried_ModelDF)
+
+Mann_ModelDF$Mann_panel <- predict(Mann_MarkerPanel, Mann_ModelDF)
+Mann_ModelDF$Seyfried_panel <- predict(Seyfried_MarkerPanel, Mann_ModelDF)
+
+seyfried_seyfriedmodel <- roc(DX ~ Seyfried_panel, Seyfried_ModelDF)
+seyfried_mannmodel <- roc(DX ~ Mann_panel, Seyfried_ModelDF)
+seyfried_ALDOA <- roc(DX ~ P04075, Seyfried_ModelDF)
+seyfried_PKM <- roc(DX ~ P14618, Seyfried_ModelDF)
+seyfried_LDHB <- roc(DX ~ P07195, Seyfried_ModelDF)
+
+ROC_SEYFRIED <- ggroc(list("ALDOA (0.85)" = seyfried_ALDOA,
+           "PKM (0.82)" = seyfried_PKM,
+           "LDHB (0.79)" = seyfried_LDHB,
+           "Model Bader (0.87)" = seyfried_mannmodel,
+           "Model Johnson (0.87)" = seyfried_seyfriedmodel), lwd = 1.5) +
+  scale_color_brewer(palette = "Dark2") + 
+  theme_pubr() +
+  theme(legend.position = "right",
+       text = element_text(family="serif")) +
+  coord_fixed()
+
+plot(ROC_SEYFRIED)
+```
+
+#### Bader Data
+
+
+Again, we observe a similair AUROC for the two models. We can thus assume that the three markers are effective at differentiating AD from Controls, indepedent from potential overfitting.
+```{r, rocplot bader, warning=FALSE, message=FALSE, class.source = 'fold-hide'}
+Mann_seyfriedmodel <- roc(DX ~ Seyfried_panel, Mann_ModelDF)
+Mann_mannmodel <- roc(DX ~ Mann_panel, Mann_ModelDF)
+Mann_ALDOA <- roc(DX ~ P04075, Mann_ModelDF)
+Mann_PKM <- roc(DX ~ P14618, Mann_ModelDF)
+Mann_LDHB <- roc(DX ~ P07195, Mann_ModelDF)
+
+ROC_MANN <- ggroc(list("ALDOA (0.81)" = Mann_ALDOA,
+           "PKM (0.78)" = Mann_PKM,
+           "LDHB (0.73)" = Mann_LDHB,
+           "Model Bader (0.83)" = Mann_mannmodel,
+           "Model Johnson (0.83)" = Mann_seyfriedmodel), lwd = 1.5) +
+  scale_color_brewer(palette = "Dark2") + 
+  theme_pubr() +
+  theme(legend.position = "right",
+       text = element_text(family="serif"), aspect.ratio=1)
+
+plot(ROC_MANN)
+```
