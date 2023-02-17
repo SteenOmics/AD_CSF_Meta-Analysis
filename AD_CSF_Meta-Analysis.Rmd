@@ -32,6 +32,7 @@ library(extrafont)
 library(wesanderson)
 library(DT)
 library(enrichR)
+library(table1)
 loadfonts(device = "win")
 ```
 ### Functions
@@ -44,7 +45,7 @@ cleanTMT_protein <- function(dataset){
   colnames_TMT_Protein <- colnames(dataset)[6:ncol(dataset)]
   dataset <- dataset %>% gather(colnames_TMT_Protein, key = "Sample", value = "Intensity") %>%
   mutate(ID = paste0(Index, "_", Gene)) %>%
-  select(ID, Sample, Intensity)
+  dplyr::select(ID, Sample, Intensity)
   return(dataset)
 }
 cleanLFQ_protein <- function(dataset){
@@ -74,7 +75,7 @@ OutlierRemover <- function(dataset, name){
     #Make the DF that we will return (i.e. without outliers)
   returnDataset <- dataset %>%
     dplyr::filter(Sample %in% dplyr::filter(SampleCorrelations, Outlier == F)$Sample) %>%
-    select(ID, Sample, DX, Intensity)  
+    dplyr::select(ID, Sample, DX, Intensity)  
   
   #Purely for visualization: Also attached PCA Plots of the removed samples
   
@@ -91,7 +92,7 @@ OutlierRemover <- function(dataset, name){
     group_by(ID) %>%
     mutate(IntensImputed = replace_na(Intensity, mean(Intensity, na.rm = T)/2)) %>%
     mutate(SampleDX = paste0(Sample,"_", DX)) %>%
-    select(ID, SampleDX, IntensImputed) %>%
+    dplyr::select(ID, SampleDX, IntensImputed) %>%
     spread(key = "ID", value = "IntensImputed") %>%
     column_to_rownames("SampleDX")
 
@@ -132,13 +133,13 @@ Ttest_AD <- function(dataset){
     drop_na(Intensity) %>%
     drop_na(DX) %>%
     group_by(ID) %>%
-    t_test(Intensity ~ DX, detailed = T) %>%
+    wilcox_test(Intensity ~ DX, detailed = T) %>%
     adjust_pvalue(method = "BH") %>%
     mutate(SIGNIFICANT = p.adj < 0.05) %>%
   mutate(log10_padj = -1*log10(p.adj))
   
   ttestPlot <- dataset_ttest %>%
-    dplyr::mutate(FC = estimate1 - estimate2) %>%
+    dplyr::mutate(FC = estimate) %>%
     mutate(log10adjustP = -1*log10(p.adj)) %>%
     mutate(Direction = ifelse(p.adj > 0.05, "NotSignificant", ifelse(FC < 0, "Down", "Up"))) %>%
     ggplot(aes(x = FC, y = log10adjustP, fill = Direction)) +
@@ -208,7 +209,7 @@ Dayon_protein_clean_noreferences <-
   mutate(Intensity = Intensity * NormalizeFactor) %>%
   ungroup() %>%
   mutate(Intensity = log2(Intensity)) %>%
-  select(ID, Sample, Intensity)
+  dplyr::select(ID, Sample, Intensity)
 ```
 
 #### mean calculation
@@ -227,8 +228,8 @@ Dayon_protein_clean_noreferences %>%
   group_by(Sample, ID) %>%
   mutate(Intensity = mean(Intensity, na.rm = TRUE)) %>%
   dplyr::filter(sample_b == "01") %>%
-  na_if("NaN") %>%
-  select(ID, Sample, Intensity)
+  mutate(Intensity = ifelse(Intensity == "NaN", NA, Intensity)) %>%
+  dplyr::select(ID, Sample, Intensity)
 ```
 
 #### Set Clinical
@@ -249,7 +250,9 @@ DayonClincalQuantiles <- DayonClinical %>%
   mutate(DX = ifelse(quantile == 1, "C", "AD"))
 
 Dayonproteinclinical <- left_join(DayonClincalQuantiles, Dayon_protein_clean_averaged, by = c("Subject ID" = "Sample"), keep = TRUE) %>%
-  select(ID, Sample, DX, Intensity)
+  dplyr::select(ID, Sample, DX, Intensity)
+
+
 ```
 
 #### Outlier Selection
@@ -257,11 +260,11 @@ Dayonproteinclinical <- left_join(DayonClincalQuantiles, Dayon_protein_clean_ave
 Dayonproteinclinical_NO <- OutlierRemover(Dayonproteinclinical, "Dayon")
 ```
 
-#### T-test
+#### Mann-Whitney U Test
 ```{r, ttest Dayon, class.source = 'fold-hide'}
 Dayon_ttest <- Ttest_AD(Dayonproteinclinical) %>%
-  dplyr::mutate(FC = estimate1 - estimate2) %>%
-  dplyr::select(ID, FC, p.adj)
+  dplyr::mutate(FC = estimate) %>%
+  dplyr::select(ID, FC, p, p.adj)
 
 # put CSV, XLS, and PDF in a collection
 DT::datatable(Dayon_ttest, extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = list('copy', 'print', list(extend = 'collection',
@@ -270,7 +273,7 @@ DT::datatable(Dayon_ttest, extensions = 'Buttons', options = list(dom = 'Bfrtip'
 
 Ttest_AD
 
-### Omar
+### In-House
 
 #### Normalization
 We normalize on reference samples. These have the substring Ref (or Rof.. Again, small writing mistake)
@@ -302,7 +305,7 @@ Omar_protein_clean_noreferences <-
   mutate(Intensity = Intensity * NormalizeFactor) %>%
   ungroup() %>%
   mutate(Intensity = log2(Intensity)) %>%
-  select(ID, Sample, Intensity)
+  dplyr::select(ID, Sample, Intensity)
 ```
 
 #### mean calculation
@@ -322,8 +325,8 @@ Omar_protein_clean_noreferences %>%
   group_by(Sample, ID) %>%
   mutate(Intensity = mean(Intensity, na.rm = TRUE)) %>%
   dplyr::filter(sample_b == "1") %>%
-  na_if("NaN") %>%
-  select(ID, Sample, Intensity)
+  mutate(Intensity = ifelse(Intensity == "NaN", NA, Intensity)) %>%
+  dplyr::select(ID, Sample, Intensity)
 ```
 
 #### Clinical
@@ -333,7 +336,8 @@ Omarproteinclinical <- Omar_protein_clean_averaged %>%
   dplyr::filter(grepl('A|C', Sample)) %>% 
   mutate(sample_b = substr(Sample, 1, 1)) %>%
   mutate(DX = ifelse(sample_b == "A", "AD", "C")) %>%
-  select(ID, Sample, DX, Intensity)
+  dplyr::select(ID, Sample, DX, Intensity)
+
 ```
 
 #### Outlier Selection
@@ -341,11 +345,11 @@ Omarproteinclinical <- Omar_protein_clean_averaged %>%
 Omarproteinclinical_NO <- OutlierRemover(Omarproteinclinical, "Omar")
 ```
 
-#### T-test
+#### Mann-Whitney U Test
 ```{r, ttest Omar, class.source = 'fold-hide'}
 omar_ttest <- Ttest_AD(Omarproteinclinical_NO) %>%
-  dplyr::mutate(FC = estimate1 - estimate2) %>%
-  dplyr::select(ID, FC, p.adj)
+  dplyr::mutate(FC = estimate) %>%
+  dplyr::select(ID, FC, p, p.adj)
 
 # put CSV, XLS, and PDF in a collection
 DT::datatable(omar_ttest, extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = list('copy', 'print', list(extend = 'collection',
@@ -373,7 +377,7 @@ Sathe_protein_clean %>%
   mutate(NormalizeFactor = Sathe_medianSummedIntensity/ PerSampleSum) %>%
   mutate(Intensity = Intensity * NormalizeFactor) %>%
   ungroup() %>%
-  select(ID, Sample, Intensity) %>%
+  dplyr::select(ID, Sample, Intensity) %>%
   mutate_all(~replace(., . == 0, NA)) %>%
   mutate(Intensity = log2(Intensity))
 ```
@@ -392,8 +396,8 @@ Sathe_protein_clean_averaged <-
   group_by(Sample, ID) %>%
   mutate(Intensity = mean(Intensity, na.rm = TRUE)) %>%
   dplyr::filter(second == "1") %>%
-  na_if("NaN") %>%
-  select(ID, Sample, Intensity)
+  mutate(Intensity = ifelse(Intensity == "NaN", NA, Intensity)) %>%
+  dplyr::select(ID, Sample, Intensity)
 ```
 
 #### Clinical
@@ -403,7 +407,7 @@ Satheproteinclinical <-
   Sathe_protein_clean_averaged %>%
   mutate(AD= grepl("C",Sample)) %>%
   mutate(DX = ifelse(AD == TRUE, "C", "AD")) %>%
-  select(ID, Sample, DX, Intensity)
+  dplyr::select(ID, Sample, DX, Intensity)
 ```
 
 
@@ -413,11 +417,11 @@ Satheproteinclinical_NO <- OutlierRemover(Satheproteinclinical, "Sathe")
 ```
 
 
-#### T-test
+#### Mann-Whitney U Test
 ```{r, ttest sathe, class.source = 'fold-hide'}
 sathe_ttest <- Ttest_AD(Satheproteinclinical_NO) %>%
-  dplyr::mutate(FC = estimate1 - estimate2) %>%
-  dplyr::select(ID, FC, p.adj)
+  dplyr::mutate(FC = estimate) %>%
+  dplyr::select(ID, FC, p, p.adj)
 
 # put CSV, XLS, and PDF in a collection
 DT::datatable(sathe_ttest, extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = list('copy', 'print', list(extend = 'collection',
@@ -446,7 +450,7 @@ Lleo_protein_clean %>%
   mutate(NormalizeFactor = Lleo_medianSummedIntensity/ PerSampleSum) %>%
   mutate(Intensity = Intensity * NormalizeFactor) %>%
   ungroup() %>%
-  select(ID, Sample, Intensity) %>%
+  dplyr::select(ID, Sample, Intensity) %>%
   mutate_all(~replace(., . == 0, NA)) %>%
   mutate(Intensity = log2(Intensity))
 ```
@@ -462,7 +466,7 @@ Each sample is the POOL of 10 samples.
 Lleoproteinclinical <- Lleo_protein_normalized %>%
   mutate(Sample = str_remove_all(Sample, " MaxLFQ Total Intensity")) %>%
   mutate(DX = ifelse(Sample == "01_01", "AD", "C")) %>%
-  select(ID, Sample, DX, Intensity)
+  dplyr::select(ID, Sample, DX, Intensity)
 ```
 
 #### Outlier Selection
@@ -470,7 +474,7 @@ Lleoproteinclinical <- Lleo_protein_normalized %>%
 Lleoproteinclinical_NO <- OutlierRemover(Lleoproteinclinical, "Lleo")
 ```
 
-#### T-test
+#### Mann-Whitney U Test
 Not available in Lleo data due to single AD sample.
 
 ### Khoonsari
@@ -495,7 +499,7 @@ Khoonsari_protein_clean %>%
   mutate(NormalizeFactor = Khoonsari_medianSummedIntensity/ PerSampleSum) %>%
   mutate(Intensity = Intensity * NormalizeFactor) %>%
   ungroup() %>%
-  select(ID, Sample, Intensity) %>%
+  dplyr::select(ID, Sample, Intensity) %>%
   mutate_all(~replace(., . == 0, NA)) %>%
   mutate(Intensity = log2(Intensity))
 ```
@@ -515,8 +519,8 @@ Khoonsari_protein_clean_averaged <-
   group_by(Sample, ID) %>%
   mutate(Intensity = mean(Intensity, na.rm = TRUE)) %>%
   dplyr::filter(second == "1") %>%
-  na_if("NaN") %>%
-  select(ID, Sample, Intensity)
+  mutate(Intensity = ifelse(Intensity == "NaN", NA, Intensity)) %>%
+  dplyr::select(ID, Sample, Intensity)
 ```
 
 #### Clinical
@@ -526,7 +530,7 @@ Khoonsariproteinclinical <-
 Khoonsari_protein_clean_averaged %>%
   mutate(AD= grepl("AD",Sample)) %>%
   mutate(DX = ifelse(AD == TRUE, "AD", "C")) %>%
-  select(ID, Sample, DX, Intensity)
+  dplyr::select(ID, Sample, DX, Intensity)
 ```
 
 
@@ -535,18 +539,18 @@ Khoonsari_protein_clean_averaged %>%
 Khoonsariproteinclinical_NO <- OutlierRemover(Khoonsariproteinclinical, "Khoonsari")
 ```
 
-#### T-test
+#### Mann-Whitney U Test
 ```{r, ttest khoonsari, class.source = 'fold-hide'}
 khoonsari_ttest <- Ttest_AD(Khoonsariproteinclinical_NO) %>%
-  dplyr::mutate(FC = estimate1 - estimate2) %>%
-  dplyr::select(ID, FC, p.adj)
+  dplyr::mutate(FC = estimate) %>%
+  dplyr::select(ID, FC, p, p.adj)
 
 # put CSV, XLS, and PDF in a collection
 DT::datatable(khoonsari_ttest, extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = list('copy', 'print', list(extend = 'collection',
         buttons = c('csv', 'excel'),text = 'Download' ))))
 ```
 
-### Multhaup
+### Barucker
 
 #### Normalization
 We determine the summed intensity (un-transformed) of each sample.
@@ -568,7 +572,7 @@ Multhaup_protein_clean %>%
   mutate(NormalizeFactor = Multhaup_medianSummedIntensity/ PerSampleSum) %>%
   mutate(Intensity = Intensity * NormalizeFactor) %>%
   ungroup() %>%
-  select(ID, Sample, Intensity) %>%
+  dplyr::select(ID, Sample, Intensity) %>%
   mutate_all(~replace(., . == 0, NA)) %>%
   mutate(Intensity = log2(Intensity))
 ```
@@ -581,21 +585,21 @@ Multhaup_protein_normalized %>%
   mutate(Sample = str_remove_all(Sample, " MaxLFQ Total Intensity")) %>%
   mutate(NAD= grepl("NAD",Sample)) %>%
   mutate(DX = ifelse(NAD == TRUE, "C", "AD")) %>%
-  select(ID, Sample, DX, Intensity)
+  dplyr::select(ID, Sample, DX, Intensity)
 ```
 
 
 #### Outlier Selection
 ```{r, outlier selection Multhaup, class.source = 'fold-hide'}
-Multhaupproteinclinical_NO <- OutlierRemover(Multhaupproteinclinical, "Multhaup")
+Multhaupproteinclinical_NO <- OutlierRemover(Multhaupproteinclinical, "Barucker")
 ```
 
 
-#### T-test
+#### Mann-Whitney U Test
 ```{r, ttest multhaup, class.source = 'fold-hide'}
 multhaup_ttest <- Ttest_AD(Multhaupproteinclinical_NO) %>%
-  dplyr::mutate(FC = estimate1 - estimate2) %>%
-  dplyr::select(ID, FC, p.adj)
+  dplyr::mutate(FC = estimate) %>%
+  dplyr::select(ID, FC, p, p.adj)
 
 # put CSV, XLS, and PDF in a collection
 DT::datatable(multhaup_ttest, extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = list('copy', 'print', list(extend = 'collection',
@@ -625,7 +629,7 @@ Wang_protein_clean %>%
   mutate(NormalizeFactor = Wang_medianSummedIntensity/ PerSampleSum) %>%
   mutate(Intensity = Intensity * NormalizeFactor) %>%
   ungroup() %>%
-  select(ID, Sample, Intensity) %>%
+  dplyr::select(ID, Sample, Intensity) %>%
   mutate_all(~replace(., . == 0, NA)) %>%
   mutate(Intensity = log2(Intensity))
 ```
@@ -646,8 +650,8 @@ Wang_protein_clean_averaged <-
   group_by(Sample, ID) %>%
   mutate(Intensity = mean(Intensity, na.rm = TRUE)) %>%
   dplyr::filter(fourth == "1") %>%
-  na_if("NaN") %>%
-  select(ID, Sample, Intensity)
+  mutate(Intensity = ifelse(Intensity == "NaN", NA, Intensity)) %>%
+  dplyr::select(ID, Sample, Intensity)
 ```
 
 #### Clinical
@@ -664,7 +668,7 @@ Wangproteinclinical <-
 left_join(Wang_Clinical, Wang_protein_clean_averaged, by = c("Sample" = "third")) %>%
   mutate(Sample = Sample.y) %>%
   dplyr::filter(!DX == "MCI") %>%
-  select(ID, Sample, DX, Intensity)
+  dplyr::select(ID, Sample, DX, Intensity)
 ```
 
 
@@ -673,11 +677,11 @@ left_join(Wang_Clinical, Wang_protein_clean_averaged, by = c("Sample" = "third")
 Wangproteinclinical_NO <- OutlierRemover(Wangproteinclinical, "Wang")
 ```
 
-#### T-test
+#### Mann-Whitney U Test
 ```{r, ttest wang, class.source = 'fold-hide'}
 wang_ttest <- Ttest_AD(Wangproteinclinical_NO) %>%
-  dplyr::mutate(FC = estimate1 - estimate2) %>%
-  dplyr::select(ID, FC, p.adj)
+  dplyr::mutate(FC = estimate) %>%
+  dplyr::select(ID, FC, p, p.adj)
 
 # put CSV, XLS, and PDF in a collection
 DT::datatable(wang_ttest, extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = list('copy', 'print', list(extend = 'collection',
@@ -759,7 +763,7 @@ PCA_PLOT <- function(dataset, dataset2) {
     gather(key = "ID", value = "Intensity", unique(ProteinsToKeep$ID)) %>%
     mutate(IntensImputed = replace_na(Intensity, mean(Intensity, na.rm = T)/2)) %>%
     mutate(SampleDX = paste0(Sample,"/", DX, "/", Dataset)) %>%
-    select(ID, SampleDX, IntensImputed) %>%
+    dplyr::select(ID, SampleDX, IntensImputed) %>%
     spread(key = "ID", value = "IntensImputed") %>%
     column_to_rownames("SampleDX")
 
@@ -795,7 +799,7 @@ PCA_PLOT <- function(dataset, dataset2) {
     gather(key = "ID", value = "Z_score", unique(ProteinsToKeep$ID)) %>%
     mutate(IntensImputed = replace_na(Z_score, mean(Z_score, na.rm = T)/2)) %>%
     mutate(SampleDX = paste0(Sample,"/", DX, "/", Dataset)) %>%
-    select(ID, SampleDX, IntensImputed) %>%
+    dplyr::select(ID, SampleDX, IntensImputed) %>%
     spread(key = "ID", value = "IntensImputed") %>%
     column_to_rownames("SampleDX")
 
@@ -826,10 +830,8 @@ PCA_PLOT <- function(dataset, dataset2) {
 
 PCA_PLOT_BeforeAfter <- PCA_PLOT(Allproteinclinical , Allproteinclinical_Zscored)
 ```
-
-
-## T-test combined Dataset
-Apply 70% cut off, run a T-test with Benjamini Hochberg Correction.
+## Mann-Whitney combined Dataset
+Apply 70% cut off, run a mann-whitney test with Benjamini Hochberg Correction.
 ```{r, Volcano_combined, warning=FALSE, class.source = 'fold-hide', fig.width=6, fig.height=6}
 
 Allproteinclinical_Zscored <- Allproteinclinical_Zscored %>%
@@ -856,6 +858,7 @@ Tttest_all <- Tttest_all %>%
   
 VolcanoAll <- Tttest_all %>%
   ggplot(aes(x = estimate, y = log10_padj, fill = SIGNIFICANT)) + 
+  theme(text = element_text(family="serif")) +
   geom_point(size = 3, shape = 21) +
   geom_text_repel(aes(label = Gene), data = Tttest_all[Tttest_all$p.adj < 0.05,], box.padding = 0.5, max.overlaps = Inf) +
   scale_fill_manual(values = c("darkgrey", "darkred")) +
@@ -864,20 +867,118 @@ VolcanoAll <- Tttest_all %>%
     xlim(-2.2,2.2)+
     xlab("Z-score") +
     ylab("-log10(adjusted p-value)") +
-  theme(legend.position= "none") +
-  theme(text = element_text(family="serif"))
+  theme(legend.position= "none") 
 
 plot(VolcanoAll)
 
 Tttest_allDT <- Tttest_all %>%
   dplyr::mutate(FC = estimate) %>%
-  dplyr::select(ID, FC, p.adj)
+  dplyr::select(ID, FC, p, p.adj)
 
 
 # put CSV, XLS, and PDF in a collection
 DT::datatable(Tttest_allDT, extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = list('copy', 'print', list(extend = 'collection',
         buttons = c('csv', 'excel'),text = 'Download' ))))
 ```
+
+## Heatmap before cut off, after Cut off and significant
+To illustrate the effect of the 70% cut off filter we make a heatmap of the whole dataset before and after 70% cut off filter.
+
+### Before Cut off
+Ordered for Dataset
+```{r, heatmap before , warning=FALSE, message=FALSE, class.source = 'fold-hide'}
+SuperHeatmap <- Allproteinclinical_Zscored %>%
+  dplyr::select(ID, Sample, Dataset, DX, Z_score) %>%
+  spread(key = "ID", value = "Z_score") %>%
+  arrange(Dataset)
+
+
+Heatmap(as.matrix(SuperHeatmap[4:ncol(SuperHeatmap)]),
+        cluster_rows = F,
+        cluster_columns = F,
+        show_column_names = F,
+        left_annotation = rowAnnotation(Dataset = SuperHeatmap$Dataset, col = list(Dataset = c("Barucker" = "#265DAB",
+                                                                                               "Dayon" = "#DF5C24",
+                                                                                               "In-house" = "#059748",
+                                                                                               "Khoonsari" = "#E5126F",
+                                                                                               "Lleó" = "#9D722A",
+                                                                                               "Sathe" = "#7B3A96",
+                                                                                               "Wang" = "#C7B42E"))),
+        right_annotation = rowAnnotation(DX = SuperHeatmap$DX, col = list(DX = c("AD" = "darkred", "C" = "darkgrey"))))
+```
+
+
+### After Cut off
+Ordered for Dataset.
+```{r, heatmap after , warning=FALSE, message=FALSE, class.source = 'fold-hide'}
+SuperHeatmap <- Allproteinclinical_Zscored %>%
+    filter(ID %in% ProteinsToKeep_all$ID) %>%
+  dplyr::select(ID, Sample, Dataset, DX, Z_score) %>%
+  spread(key = "ID", value = "Z_score") %>%
+  arrange(Dataset)
+
+
+Heatmap(as.matrix(SuperHeatmap[4:ncol(SuperHeatmap)]),
+        cluster_rows = F,
+        cluster_columns = F,
+        show_column_names = F,
+        left_annotation = rowAnnotation(Dataset = SuperHeatmap$Dataset, col = list(Dataset = c("Barucker" = "#265DAB",
+                                                                                               "Dayon" = "#DF5C24",
+                                                                                               "In-house" = "#059748",
+                                                                                               "Khoonsari" = "#E5126F",
+                                                                                               "Lleó" = "#9D722A",
+                                                                                               "Sathe" = "#7B3A96",
+                                                                                               "Wang" = "#C7B42E"))),
+        right_annotation = rowAnnotation(DX = SuperHeatmap$DX, col = list(DX = c("AD" = "darkred", "C" = "darkgrey"))))
+```
+
+### Filtering for only the significant. 
+Ordered for both Dataset and DX.
+```{r, heatmap signficant , warning=FALSE, message=FALSE, class.source = 'fold-hide'}
+SignificantHits <- Tttest_all %>%
+  dplyr::filter(SIGNIFICANT == T)
+
+SuperHeatmap <- Allproteinclinical_Zscored %>%
+    filter(ID %in% SignificantHits$ID) %>%
+  dplyr::select(ID, Sample, Dataset, DX, Z_score) %>%
+  spread(key = "ID", value = "Z_score") %>%
+  arrange(Dataset)
+
+
+Heatmap(as.matrix(SuperHeatmap[4:ncol(SuperHeatmap)]),
+        cluster_rows = F,
+        cluster_columns = F,
+        show_column_names = T,
+        left_annotation = rowAnnotation(Dataset = SuperHeatmap$Dataset, col = list(Dataset = c("Barucker" = "#265DAB",
+                                                                                               "Dayon" = "#DF5C24",
+                                                                                               "In-house" = "#059748",
+                                                                                               "Khoonsari" = "#E5126F",
+                                                                                               "Lleó" = "#9D722A",
+                                                                                               "Sathe" = "#7B3A96",
+                                                                                               "Wang" = "#C7B42E"))),
+        right_annotation = rowAnnotation(DX = SuperHeatmap$DX, col = list(DX = c("AD" = "darkred", "C" = "darkgrey"))))
+
+SuperHeatmap <- Allproteinclinical_Zscored %>%
+    filter(ID %in% SignificantHits$ID) %>%
+  dplyr::select(ID, Sample, Dataset, DX, Z_score) %>%
+  spread(key = "ID", value = "Z_score") %>%
+  arrange(DX)
+
+
+Heatmap(as.matrix(SuperHeatmap[4:ncol(SuperHeatmap)]),
+        cluster_rows = F,
+        cluster_columns = F,
+        show_column_names = T,
+        left_annotation = rowAnnotation(Dataset = SuperHeatmap$Dataset, col = list(Dataset = c("Barucker" = "#265DAB",
+                                                                                               "Dayon" = "#DF5C24",
+                                                                                               "In-house" = "#059748",
+                                                                                               "Khoonsari" = "#E5126F",
+                                                                                               "Lleó" = "#9D722A",
+                                                                                               "Sathe" = "#7B3A96",
+                                                                                               "Wang" = "#C7B42E"))),
+        right_annotation = rowAnnotation(DX = SuperHeatmap$DX, col = list(DX = c("AD" = "darkred", "C" = "darkgrey"))))
+```
+
 
 ## Heatmap Combined vs. Single.
 Join all the dataframes for the siginificant proteins in the combined dataset to compare with the statistics of single datasets.
@@ -894,42 +995,42 @@ HeatmapDF <- left_join(
             filter(ID %in% SignificantHits$ID) %>%
             separate(ID, c("UniProt", "Gene"), remove = F) %>%
             mutate(Dayon = -1*log10(as.numeric(p.adj))) %>%
-            select(Gene, Dayon),
+            dplyr::select(Gene, Dayon),
             sathe_ttest %>%
             filter(ID %in% SignificantHits$ID) %>%
             separate(ID, c("UniProt", "Gene"), remove = F) %>%
             mutate(Sathe = -1*log10(as.numeric(p.adj))) %>%
-            select(Gene, Sathe),
+            dplyr::select(Gene, Sathe),
             by = c("Gene" = "Gene")),
             khoonsari_ttest %>%
             filter(ID %in% SignificantHits$ID) %>%
             separate(ID, c("UniProt", "Gene"), remove = F) %>%
             mutate(Khoonsari = -1*log10(as.numeric(p.adj))) %>%
-            select(Gene, Khoonsari),
+            dplyr::select(Gene, Khoonsari),
           by = c("Gene" = "Gene")),
             multhaup_ttest %>%
             filter(ID %in% SignificantHits$ID) %>%
             separate(ID, c("UniProt", "Gene"), remove = F) %>%
             mutate(Barucker = -1*log10(as.numeric(p.adj))) %>%
-            select(Gene, Barucker),
+            dplyr::select(Gene, Barucker),
           by = c("Gene" = "Gene")),
     wang_ttest %>%
     filter(ID %in% SignificantHits$ID) %>%
     separate(ID, c("UniProt", "Gene"), remove = F) %>%
     mutate(Wang = -1*log10(as.numeric(p.adj))) %>%
-    select(Gene, Wang),
+    dplyr::select(Gene, Wang),
   by = c("Gene" = "Gene")),
     omar_ttest %>%
     filter(ID %in% SignificantHits$ID) %>%
     separate(ID, c("UniProt", "Gene"), remove = F) %>%
     mutate(In_house = -1*log10(as.numeric(p.adj))) %>%
-    select(Gene, In_house),
+    dplyr::select(Gene, In_house),
   by = c("Gene" = "Gene")),
     Tttest_all %>%
     filter(ID %in% SignificantHits$ID) %>%
     separate(ID, c("UniProt", "Gene"), remove = F) %>%
     mutate(Meta = -1*log10(as.numeric(p.adj))) %>%
-    select(Gene, Meta),
+    dplyr::select(Gene, Meta),
   by = c("Gene" = "Gene")) %>%
   arrange(Gene = desc(Meta)) %>%
   column_to_rownames("Gene")
@@ -951,6 +1052,7 @@ Heatmap_ALL <- Heatmap(as.matrix(HeatmapDF),
 plot(Heatmap_ALL)
 ```
 
+
 ## msgidb Hallmark Enrichment
 Use the msgidb Hallmark enrichment dataset to see what proteins are affected in our combined dataset.
 ```{r, Hallmark, class.source = 'fold-hide'}
@@ -970,38 +1072,11 @@ enrichResults <- enricher(gene = SignificantHits$Gene, TERM2GENE = msigdbr_t2g)
 HallMarkPlot <- cnetplot(enrichResults, cex_category = 2, cex_label_category = 1, cex__label_gene = 1) +
   scale_color_manual(values = c("#3B9AB2", "#F21A00")) +
   theme(legend.position = "none") +
-  theme(text = element_text(family="serif"))
+  theme(text = element_text(family="serif")) 
   
 plot(HallMarkPlot)
 ```
 
-## KEGG Enrichment
-Use the KEGG enrichment dataset to see what proteins are affected in our combined dataset.
-```{r, kegg enrichment, warning=FALSE, class.source = 'fold-hide'}
-#Enrich for each colour
-enrichtments <- enrichR::enrichr(SignificantHits$Gene,
-                              c("KEGG_2021_Human"))
-
-myPalette <-colorRampPalette(rev(RColorBrewer::brewer.pal(11, "Spectral")))
-sc <- scale_colour_gradientn(colours = myPalette(100), limits=c(0.0, 0.02))
-
-KeggPlot <- enrichtments$KEGG_2021_Human %>%
-  slice_head(n = 10) %>%
-  mutate_at("Term", str_trunc, width = 45) %>%
-  select(Term, Genes, Adjusted.P.value, Overlap) %>%
-  mutate(KeggPathway = fct_reorder(Term, Adjusted.P.value, .desc = T)) %>%
-  separate(Overlap, c("Count", "All")) %>%
-  mutate(GeneRatio = as.numeric(Count)/ as.numeric(All)) %>%
-  mutate(Count = as.numeric(Count)) %>%
-  ggplot(aes(x = GeneRatio, y = KeggPathway, colour = Adjusted.P.value, )) +
-  geom_point(aes(size=Count)) +
-  scale_colour_gradient(low = "red", high = "darkblue") +
-  theme_pubr() +
-  theme(legend.position = "right") +
-  theme(text = element_text(family="serif"))
-  
-plot(KeggPlot)
-```
 
 
 # 2. Pruning
@@ -1026,7 +1101,7 @@ Zetterberg_protein_clean %>%
   mutate(NormalizeFactor = Zetterberg_medianSummedIntensity/ PerSampleSum) %>%
   mutate(Intensity = Intensity * NormalizeFactor) %>%
   ungroup() %>%
-  select(ID, Sample, Intensity) %>%
+  dplyr::select(ID, Sample, Intensity) %>%
   mutate_all(~replace(., . == 0, NA)) %>%
   mutate(Intensity = log2(Intensity))
 ```
@@ -1036,17 +1111,17 @@ Zetterberg_protein_clean %>%
 #Add with Clinical
 Zetterberg_protein_normalized <- Zetterberg_protein_normalized %>%
   separate(Sample, c("first", "second", "third", "fourth", "Sample")) %>%
-  select(ID, Sample, Intensity)
+  dplyr::select(ID, Sample, Intensity)
 
 Zetterberg_Clinical <- read_excel("Datasets/Zetterberg_Clinical.xlsx")
 
 Zetterbergproteinclinical <- left_join(Zetterberg_Clinical, Zetterberg_protein_normalized, by = c("Sample" = "Sample")) %>%
-  select(ID, Sample, DX, Intensity)
+  dplyr::select(ID, Sample, DX, Intensity)
 
 Zetterbergproteinclinical_NO <- OutlierRemover(Zetterbergproteinclinical, "Pruning Dataset")
 ```
 
-### T-Test
+### Mann-Whitney Test
 ```{r, volcano pruning, warning=FALSE, class.source = 'fold-hide', fig.width=6, fig.height=6}
 Ttest_AD_Zscore <- function(dataset){
   #70% cut off
@@ -1093,7 +1168,7 @@ plot(VolcanoPruning)
 
 Zetterberg_ttestDT <- Zetterberg_ttest %>%
   dplyr::mutate(FC = estimate) %>%
-  dplyr::select(ID, FC, p.adj)
+  dplyr::select(ID, FC, p, p.adj)
 
 
 # put CSV, XLS, and PDF in a collection
@@ -1149,6 +1224,7 @@ Seyfried_DF[Seyfried_DF == 0] <- NA
 Mann_DF <- read_excel("Datasets/Mann_Matrix.xlsx")
 Mann_DF[Mann_DF == 0] <- NA
 ```
+
 
 ## Johnson Data
 Study used DDA TMT on a large cohort (Emory University, USA).
@@ -1243,7 +1319,7 @@ Using Logistic Regression we develop biomarker panels of the three selected biom
 ```{r, model Johnson , warning=FALSE, class.source = 'fold-hide'}
 Seyfried_ModelDF <- Seyfried_resultmatrix %>%
  dplyr::filter(rowID %in% c("P04075", "P14618", "P07195")) %>%
-  select(Sample, 'rowID', DX, Intensity) %>%
+  dplyr::select(Sample, 'rowID', DX, Intensity) %>%
   spread(key = "rowID", value = "Intensity")
 
 Seyfried_ModelDF <- data.frame(Seyfried_ModelDF)
@@ -1258,7 +1334,7 @@ Seyfried_MarkerPanel <- glm(DX ~ P04075 + P14618 + P07195, data = Seyfried_Model
 ```{r, model Bader, warning=FALSE, class.source = 'fold-hide'}
 Mann_ModelDF <- Mann_resultmatrix %>%
  dplyr::filter(rowID %in% c("P04075", "P14618", "P07195")) %>%
-  select(Sample, 'rowID', DX, Intensity) %>%
+  dplyr::select(Sample, 'rowID', DX, Intensity) %>%
   spread(key = "rowID", value = "Intensity")
 
 Mann_ModelDF$DX <- as.factor(Mann_ModelDF$DX)
@@ -1313,9 +1389,9 @@ Mann_LDHB <- roc(DX ~ P07195, Mann_ModelDF)
 
 ROC_MANN <- ggroc(list("ALDOA (0.81)" = Mann_ALDOA,
            "PKM (0.78)" = Mann_PKM,
-           "LDHB (0.73)" = Mann_LDHB,
-           "Model Bader (0.83)" = Mann_mannmodel,
-           "Model Johnson (0.83)" = Mann_seyfriedmodel), lwd = 1.5) +
+           "LDHB (0.68)" = Mann_LDHB,
+           "Model Bader (0.82)" = Mann_mannmodel,
+           "Model Johnson (0.82)" = Mann_seyfriedmodel), lwd = 1.5) +
   scale_color_brewer(palette = "Dark2") + 
   theme_pubr() +
   theme(legend.position = "right",
@@ -1323,3 +1399,332 @@ ROC_MANN <- ggroc(list("ALDOA (0.81)" = Mann_ALDOA,
 
 plot(ROC_MANN)
 ```
+
+### Evaluation of the 21 Biomarker Candidates
+
+Indepedent from our down-selection dataset, we were also interested to assess the AUROC's of the discovery's 21 biomarker candidates in the two validation cohorts. That data is produced here as 21 Visualizations. 
+
+```{r, fig.width=14, fig.height=5}
+MANNPROT <- colnames(Mann_DF)[2:ncol(Mann_DF)]
+
+MANNDATA <- Mann_DF %>%
+  gather(MANNPROT, key = "SAMPLE", value = "INTENSITY") %>%
+  separate(SAMPLE, sep = "_", into = c("Thing", "Sample", "DX")) %>%
+  mutate(INTENSITY = log2(INTENSITY),
+         DX = toupper(DX),
+         sample = paste0(Thing, Sample)) %>%
+group_by(rowID, sample) %>%
+#filter(n() > 1) %>%
+ mutate(INTENSITY = mean(INTENSITY, na.rm = T)) %>%
+ slice(1) %>%
+ ungroup()
+  
+MANNDATA_FILTER <- MANNDATA %>%
+    group_by(rowID) %>%
+    summarise(PercentMissing = sum(!is.na(INTENSITY)) / length(unique(MANNDATA$sample))) %>%
+    mutate(remove = PercentMissing > 0.7) %>%
+    dplyr::filter(remove == T)
+
+Seyfried_resultmatrix
+Tttest_all_MANN <- MANNDATA %>%
+  dplyr::filter(rowID %in% MANNDATA_FILTER$rowID) %>%
+    drop_na(INTENSITY) %>%
+    drop_na(DX) %>%
+    group_by(rowID) %>%
+    wilcox_test(INTENSITY ~ DX, detailed = T) %>%
+    adjust_pvalue(method = "BH") %>%
+  mutate(SIGNIFICANT = p.adj < 0.05) %>%
+  mutate(log10_padj = -1*log10(p.adj))
+
+
+  
+JOHNSONDATA_FILTER <- Seyfried_resultmatrix %>%
+    group_by(rowID) %>%
+    summarise(PercentMissing = sum(!is.na(Intensity)) / length(unique(Seyfried_resultmatrix$Sample))) %>%
+    mutate(remove = PercentMissing > 0.7) %>%
+    dplyr::filter(remove == T)
+
+Tttest_all_JOHNSON <- Seyfried_resultmatrix %>%
+  dplyr::filter(rowID %in% JOHNSONDATA_FILTER$rowID) %>%
+    drop_na(Intensity) %>%
+    drop_na(DX) %>%
+    group_by(rowID) %>%
+    wilcox_test(Intensity ~ DX, detailed = T) %>%
+    adjust_pvalue(method = "BH") %>%
+  mutate(SIGNIFICANT = p.adj < 0.05) %>%
+  mutate(log10_padj = -1*log10(p.adj))
+
+top21 <- Tttest_all %>%
+  filter(p.adj < 0.05) %>%
+  separate(ID, sep = "_", into = c("Uniprot", "Gene")) %>%
+  select(Uniprot, Gene, p, p.adj)
+
+mann_top21 <- Tttest_all_MANN %>%
+  filter(rowID %in% top21$Uniprot) %>%
+  select(rowID, p, p.adj)
+
+John_top21 <- Tttest_all_JOHNSON %>%
+  filter(rowID %in% top21$Uniprot) %>%
+  select(rowID, p, p.adj)
+
+top21_all <- top21 %>%
+  left_join(John_top21, by = c("Uniprot" = "rowID")) %>%
+  left_join(mann_top21, by = c("Uniprot" = "rowID"))
+
+for (i in top21$Uniprot){
+
+discovery_roc <- 
+  Allproteinclinical_Zscored %>%
+  filter(grepl(i, ID))
+proteinname <- discovery_roc[1,1]
+
+discovery_roc <- roc(discovery_roc$DX, discovery_roc$Z_score)
+
+discovery_boxplot <- 
+  Allproteinclinical_Zscored %>%
+  filter(grepl(i, ID)) %>%
+  mutate(Type = "Discovery") %>%
+  ggplot(aes(x = DX, y = Z_score, fill = DX)) +
+  geom_boxplot() +
+  facet_wrap(~ Type) +
+  scale_alpha_discrete(range = c(1, 0)) +
+  scale_fill_manual(values = c("grey", "white")) +
+  theme_pubr() +
+  #ylim(-1, 1.5) +
+  ylab("Z-Score") +
+    theme(axis.title.x=element_blank(),
+        legend.position = "none",
+        text = element_text(family="serif"))
+
+pruning_roc <- Zetterbergproteinclinical_Zscore %>%
+    filter(grepl(i, ID)) %>% 
+  drop_na()
+if (nrow(pruning_roc) == 0){
+  pruning_roc <- NULL
+} else {
+  pruning_roc <- roc(pruning_roc$DX, pruning_roc$Z_score)
+}
+
+try(Pruning_boxplot <- Zetterbergproteinclinical_Zscore %>%
+    filter(grepl(i, ID)) %>%
+  mutate(Type = "Pruning") %>%
+  ggplot(aes(x = DX, y = Z_score, fill = DX)) +
+  geom_boxplot() +
+  scale_alpha_discrete(range = c(1, 0)) +
+  scale_fill_manual(values = c("orange", "white")) +
+  theme_pubr() +
+  facet_wrap(~ Type) +
+  #ylim(-1, 1.5) +
+  ylab("Z-Score") +
+    theme(axis.title.x=element_blank(),
+        legend.position = "none",
+        text = element_text(family="serif")))
+
+mann_roc <- MANNDATA %>%
+    filter(grepl(i, rowID)) %>%
+  drop_na()
+if (nrow(mann_roc) == 0){
+  mann_roc <- NULL
+} else {
+  try(mann_roc <- roc(mann_roc$DX, mann_roc$INTENSITY))
+}
+
+try(mann_boxplot <- MANNDATA %>%
+    filter(grepl(i, rowID)) %>%
+  mutate(Type = "Bader et al.") %>%
+  mutate(DX = ifelse(grepl("CO", DX), "C", "AD")) %>%
+  ggplot(aes(x = DX, y = INTENSITY, fill = DX)) +
+  geom_boxplot() +
+  scale_alpha_discrete(range = c(1, 0)) +
+  scale_fill_manual(values = c("darkblue", "white")) +
+  theme_pubr() +
+  facet_wrap(~ Type) +
+  #ylim(-1, 1.5) +
+  ylab("log2(Intensity)") +
+    theme(axis.title.x=element_blank(),
+        legend.position = "none",
+        text = element_text(family="serif")))
+
+seyfried_roc <- Seyfried_resultmatrix %>%
+    filter(grepl(i, rowID)) %>%
+  drop_na()
+if (nrow(seyfried_roc) == 0){
+  seyfried_roc <- NULL
+} else {
+  try(seyfried_roc <- roc(seyfried_roc$DX, seyfried_roc$Intensity))
+}
+
+
+try(seyfried_boxplot <- Seyfried_resultmatrix %>%
+    filter(grepl(i, rowID)) %>%
+  mutate(Type = "Johnson et al.") %>%
+  mutate(DX = ifelse(grepl("Co", Sample), "C", "AD")) %>%
+  ggplot(aes(x = DX, y = Intensity, fill = DX)) +
+  geom_boxplot() +
+  scale_alpha_discrete(range = c(1, 0)) +
+  scale_fill_manual(values = c("darkred", "white")) +
+  theme_pubr() +
+  facet_wrap(~ Type) +
+  #ylim(-1, 1.5) +
+  ylab("TMT-Ratio") +
+    theme(axis.title.x=element_blank(),
+        legend.position = "none",
+        text = element_text(family="serif")))
+
+mytable <- cbind(Dataset=c("Discovery","Pruning","Johnson","Bader"),
+                 AUROC = c(round(discovery_roc$auc,2),
+                           NA,
+                           NA,
+                           NA))
+                 # AUROC = c(round(discovery_roc$auc,2),
+                 #           round(pruning_roc$auc,2),
+                 #           round(seyfried_roc$auc,2),
+                 #           round(mann_roc$auc,2)))
+
+listggroc <- list("Discovery"=discovery_roc, "Pruning" = pruning_roc, "Johnson" = seyfried_roc, "Bader" = mann_roc)
+
+if (!is.null(pruning_roc)){
+  mytable[2,2] <- round(pruning_roc$auc,2)
+} else {
+  listggroc <- within(listggroc, rm(Pruning))
+  Pruning_boxplot <- patchwork::plot_spacer()
+
+}
+
+if (!is.null(seyfried_roc)){
+  mytable[3,2] <- round(seyfried_roc$auc,2)
+} else {
+  listggroc <- within(listggroc, rm(Johnson))
+    seyfried_boxplot <- patchwork::plot_spacer()
+
+}
+
+if (!is.null(mann_roc)){
+  mytable[4,2] <- round(mann_roc$auc,2)
+} else {
+    listggroc <- within(listggroc, rm(Bader))
+      mann_boxplot <- patchwork::plot_spacer()
+
+}
+
+ggroc_plot <- 
+  ggroc(listggroc, lwd = 2) +
+  theme_pubr() +
+  scale_color_manual(values = c("Johnson" = "darkred", "Bader" = "darkblue", "Discovery" = "grey", "Pruning" = "Orange"),
+    name = "Dataset") +
+  theme(legend.position = c(.5,.3)) +
+    annotation_custom(tableGrob(mytable), xmin = -0.3, ymin=0.15, ymax=0.4)
+  
+format <- "
+AABBEEE
+CCDDEEE
+"
+
+GGPLOT <- discovery_boxplot + Pruning_boxplot + seyfried_boxplot + mann_boxplot + ggroc_plot + patchwork::plot_layout(design = format) +
+  patchwork::plot_annotation(title = proteinname, theme = theme(plot.title = element_text(size = 25)))
+
+ggsave(paste0("top21Plots/", i, ".png"), GGPLOT, width = 14, height = 4)
+
+}
+
+```
+
+### Create every 3-protein Combination
+
+Last, we were interested how our down-selection three protein panel compared to ANY other panel. The code here is by no means the most effective, its pretty 'brute-force' but gets the jobs done as there is <500 combinations. The resulting CSV file informed us about our panel combared to (any) other panel.
+
+```{r, warning=FALSE}
+#Find Intersect of the 21 proteins significant that are found in BOTH seyfried and MANN data
+topX_intersect <- base::intersect(unique(top21$Uniprot), unique(Seyfried_resultmatrix$rowID))
+topX_intersect <- base::intersect(topX_intersect, unique(MANNDATA$rowID))
+
+#Prepare the DF's
+seyfried_model3_prepare <- Seyfried_resultmatrix %>%
+  filter(rowID %in% topX_intersect) %>%
+  spread(rowID, Intensity) %>%
+  column_to_rownames("Sample") 
+
+mann_model3_prepare <- MANNDATA %>%
+  filter(rowID %in% topX_intersect) %>%
+  #mutate(INTENSITY = ifelse(INTENSITY == NaN, NA, INTENSITY)) %>%
+  spread(rowID, INTENSITY) %>%
+  dplyr::select(-Thing, -Sample, - sample) %>%
+  mutate(DX = ifelse(DX == "CO", 0, 1))
+  
+#Create results DF
+three_way_aruocs <- data.frame(matrix(ncol = 5, nrow = 0))
+colnames(three_way_aruocs) <- c("ThreeProt", "seyfried_data_seyfried_model", "seyfried_data_mann_model", "mann_data_seyfried_model", "mann_data_mann_model")
+number <- 1
+for (protein_1 in topX_intersect){
+  for (protein_2 in topX_intersect){
+    for (protein_3 in topX_intersect){
+      
+      if (protein_1 != protein_2 & protein_1 != protein_3 & protein_2 != protein_3){
+      
+        #Create Seyfried data model
+        seyfried_model3_tempSelect <- seyfried_model3_prepare %>%
+          dplyr::select(DX, protein_1, protein_2, protein_3) %>%
+          drop_na()
+        model_seyfried <- glm(DX ~ ., data = seyfried_model3_tempSelect, family = 'binomial')
+        
+        #create Mann data model
+        mann_model3_tempSelect <- mann_model3_prepare %>%
+          dplyr::select(DX, protein_1, protein_2, protein_3) %>%
+          drop_na()
+        model_mann <- glm(DX ~ ., data = mann_model3_tempSelect, family = 'binomial')
+        
+        #Use the models to create additional columns in the tempSelect DF's
+        seyfried_model3_tempSelect$model_seyfried <- predict(model_seyfried, seyfried_model3_tempSelect)
+        seyfried_model3_tempSelect$model_mann <- predict(model_mann, seyfried_model3_tempSelect)
+        mann_model3_tempSelect$model_seyfried <- predict(model_seyfried, mann_model3_tempSelect)
+        mann_model3_tempSelect$model_mann <- predict(model_mann, mann_model3_tempSelect)
+  
+        #Get the AUROC's and apply them to the results DF
+        three_way_aruocs[number,1] <- paste(protein_1, protein_2, protein_3, sep = "_")
+        three_way_aruocs[number,2] <- roc(seyfried_model3_tempSelect$DX, seyfried_model3_tempSelect$model_seyfried)$auc
+        three_way_aruocs[number,3] <- roc(seyfried_model3_tempSelect$DX, seyfried_model3_tempSelect$model_mann)$auc
+        three_way_aruocs[number,4] <- roc(mann_model3_tempSelect$DX, mann_model3_tempSelect$model_seyfried)$auc
+        three_way_aruocs[number,5] <- roc(mann_model3_tempSelect$DX, mann_model3_tempSelect$model_mann)$auc
+  
+              
+        #add number for next round 
+        number <- number + 1
+        
+      }
+    }
+  }
+}
+
+#Calculate the average of the test on train model ones
+three_way_aruocs_changes <- three_way_aruocs %>%
+  mutate(averageAUROC = (seyfried_data_mann_model + mann_data_seyfried_model) / 2) %>%
+  distinct(averageAUROC, .keep_all = T)
+
+#top100 <-
+three_way_aruocs_changes %>%
+  top_n(100, averageAUROC) %>%
+  dplyr::select(ThreeProt) %>%
+  separate(ThreeProt, sep = "_", into = c("p1", "p2", "p3")) %>%
+  gather(c("p1", "p2", "p3"), key = "protein", value = "Uniprot") %>%
+  dplyr::select(Uniprot) %>%
+  group_by(Uniprot) %>%
+  count() %>%
+  left_join(top21) %>%
+  ggplot(aes(x = n, y = reorder(Gene, n))) +
+  geom_point(size = 2) +
+  theme_bw() +
+  ggtitle("Count Proteins of the top100 AUROC's")
+
+top21protgene <- top21 %>% dplyr::select(Uniprot, Gene)
+
+AllThreeCombinations <- three_way_aruocs_changes %>%
+separate(ThreeProt, sep = "_", into = c("p1", "p2", "p3")) %>%
+  left_join(top21protgene, by = c("p1" = "Uniprot")) %>%
+    left_join(top21protgene, by = c("p2" = "Uniprot")) %>%
+    left_join(top21protgene, by = c("p3" = "Uniprot"))
+
+write.csv(AllThreeCombinations, "threeCombinationAuroc.csv")
+
+```
+
+

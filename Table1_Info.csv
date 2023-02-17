@@ -1,0 +1,9 @@
+﻿Dataset,AD,Control,UniqueProteinsIdentified,70%_cut_off,Signficant(t_test),Significant(Mann_whitney),Outliers_AD,Outliers_C,Available_Clinical_Info
+Dayon et al.,30,30,1084,245,21,45,1,0,"CSF AB42, Tau, pTau, serum albumin"
+Sathe et al.,5,5,2533,2522,6,0,1,0,AD vs Control
+Khoonsari et al.,10,10,522,409,0,0,1,0,"AD vs Control, Age, Gender (all male), age of onset (only AD), AB42 (only AD), Tau (only AD), pTau (onlyAD)."
+Lléo et al.,1,3,1418,0,NA,NA,0,0,AD vs Control (pooled of 10 samples)
+Barucket et al.,19,20,914,461,2,3,1,0,AD vs Control
+Wang et al.,4,4,433,252,1,0,0,0,AD vs Control
+In-house,4,5,1148,863,0,0,0,1,AD vs Control
+Meta-Analysis,73,77,2808,434,21,,4,1,
